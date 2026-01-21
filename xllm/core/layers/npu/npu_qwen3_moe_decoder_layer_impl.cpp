@@ -111,6 +111,7 @@ void NpuQwen3MoeDecoderLayerImpl::initialize_basic_parameters(
   // decode only feature
   param.enableAclGraphPagedAttention = FLAGS_enable_graph && !is_prefill;
   param.enableInitRoutingV3 = !is_prefill;
+  // param.enableSplitRmsNormRope = !is_prefill;
 
   // Can be applied to prefill, but has not been tested yet
   param.enableFusedReducesumDiv = !is_prefill;

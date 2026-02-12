@@ -155,6 +155,8 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     }
 
     torch::Tensor hidden_states = embed_tokens_(tokens, 0);
+    LOG(INFO) << "eagle3 hidden_states: " << hidden_states.norm();
+
     // Get hidden_states_extra from input_params.input_embedding
     // In EAGLE-3, hidden_states_extra comes from verifier layers
     // (3 layers concatenated)
@@ -163,6 +165,7 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
       LOG(WARNING) << "hidden_states_extra use embedding from tokens.";
       hidden_states_extra = hidden_states;
     }
+    LOG(INFO) << "eagle3 hidden_states_extra: " << hidden_states_extra.norm();
 
     // Apply fusion if hidden_states_extra dimension doesn't match hidden_states
     // hidden_states_extra shape: [B*L, 3*target_hidden_size] or [B*L,
@@ -170,6 +173,7 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     if (hidden_states_extra.size(-1) != hidden_states.size(-1)) {
       hidden_states_extra = fc_(hidden_states_extra, 0);
     }
+    LOG(INFO) << "eagle3 after fc: " << hidden_states_extra.norm();
 
     // Compute positional embeddings
     torch::Tensor target_cos_sin = atb_pos_emb_(cos_sin_, positions, 0);
@@ -225,6 +229,7 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
              event,
              event_flag);
     auto aux_hidden_states = hidden_states.clone();
+    LOG(INFO) << "eagle3 after decoder: " << hidden_states.norm();
     hidden_states = norm_(hidden_states, 0);
 
     // For draft decode, we capture the hidden state before norm as

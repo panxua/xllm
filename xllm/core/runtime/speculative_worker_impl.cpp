@@ -299,8 +299,10 @@ std::optional<ForwardOutput> SpeculativeWorkerImpl::step(
   }
 
   if (!input.input_params.batch_forward_type.is_decode()) {
+    LOG(INFO) << "PXY prefill";
     return step_prefill(input);
   } else {
+    LOG(INFO) << "PXY decode";
     return step_decode(input);
   }
 }

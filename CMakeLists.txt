@@ -52,7 +52,7 @@ if(USE_NPU)
           )
       endif()
     endif()
-      execute_process(COMMAND rpm -ivh  --replacepkgs --replacefiles "${CMAKE_BINARY_DIR}/xllm_kernels.rpm")
+      execute_process(COMMAND rpm --force -ivh  --replacepkgs --replacefiles "${CMAKE_BINARY_DIR}/xllm_kernels.rpm")
       file(WRITE "${CMAKE_BINARY_DIR}/.xllm_installed" "")
   endif()
 

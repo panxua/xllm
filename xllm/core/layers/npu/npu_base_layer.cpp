@@ -230,6 +230,9 @@ void BaseLayer::set_weight(const StateDict& state_dict,
   for (const auto& [name, tensor] : state_dict) {
     if (absl::EndsWith(name, tensor_name)) {
       at::Tensor mutable_tensor = tensor;
+      if (!tensor.defined()) {
+        LOG(FATAL) << "When set_weight, Tensor " << name << " is not defined.";
+      }
       correct_tensor_dtype(mutable_tensor, tensor_name);
       at_weight_tensors_[weight_position] = mutable_tensor.to(device_);
     }
@@ -247,6 +250,7 @@ void BaseLayer::set_weight(const StateDict& state_dict,
         correct_tensor_dtype(mutable_tensor, tensor_name);
         at_weight_tensors_[weight_position] = mutable_tensor.to(device_);
       } else {
+        return;
         at_weight_tensors_[weight_position] =
             state_dict
                 .get_sharded_tensor(tensor_name,

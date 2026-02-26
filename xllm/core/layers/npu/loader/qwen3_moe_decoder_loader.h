@@ -59,6 +59,7 @@ class Qwen3MoeDecoderLoader : public BaseLoader {
                                const torch::Tensor& tensor);
 
   void merge_experts_weights();
+  void merge_mlp_common_weights();
 
   torch::Tensor merge_experts_weights(std::vector<torch::Tensor>& experts_up,
                                       std::vector<torch::Tensor>& experts_gate,
@@ -74,6 +75,7 @@ class Qwen3MoeDecoderLoader : public BaseLoader {
   int32_t ep_size_;
   int32_t num_experts_;
   int32_t num_experts_per_partition_;
+  int32_t num_shared_experts_;
   int32_t ep_local_tp_size_;
   int32_t ep_local_tp_rank_;
   int32_t start_expert_id_;

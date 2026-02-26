@@ -290,8 +290,9 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
 
   // load the weight from the checkpoint
   void load_state_dict(const StateDict& state_dict) {
-    npu_embed_tokens_->load_state_dict(
-        state_dict.get_dict_with_prefix("embed_tokens."));
+    // TODO(panxuanyu): check whether has npu_embed_tokens
+    // npu_embed_tokens_->load_state_dict(
+    //     state_dict.get_dict_with_prefix("embed_tokens."));
     // call each layer's load_state_dict function
     for (int i = 0; i < layers_.size(); i++) {
       layers_[i]->load_state_dict(
@@ -301,7 +302,8 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    npu_embed_tokens_->verify_loaded_weights(prefix + "embed_tokens.");
+    // TODO(panxuanyu): check whether has npu_embed_tokens
+    // npu_embed_tokens_->verify_loaded_weights(prefix + "embed_tokens.");
     for (int i = 0; i < layers_.size(); i++) {
       layers_[i]->verify_loaded_weights(prefix + "layers." + std::to_string(i) +
                                         ".");
@@ -310,7 +312,8 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
   }
 
   void merge_loaded_weights() {
-    npu_embed_tokens_->merge_loaded_weights();
+    // npu_embed_tokens_->merge_loaded_weights(); // TODO(panxuanyu): check
+    // whether has npu_embed_tokens
     for (int i = 0; i < layers_.size(); i++) {
       layers_[i]->merge_loaded_weights();
     }

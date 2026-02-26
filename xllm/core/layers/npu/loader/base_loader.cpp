@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "base_loader.h"
 
+#include "torch_npu/torch_npu.h"
+
 namespace xllm {
 namespace layer {
 
@@ -44,16 +46,33 @@ void BaseLoader::set_weight(const StateDict& state_dict,
                             const std::string& tensor_name,
                             int weight_position,
                             bool to_host) {
+  // torch::npu::synchronize()
+  VLOG(50) << "set_weight 4 param 01311831";
   auto device = to_host ? at::kCPU : device_;
   for (const auto& [name, tensor] : state_dict) {
     if (absl::EndsWith(name, tensor_name)) {
+      VLOG(50) << "start to set weight";
+      if (!tensor.defined()) {
+        LOG(FATAL) << "Set_weight failed, " << tensor_name
+                   << " is not defined.";
+      }
       at::Tensor mutable_tensor = tensor;
+      torch::npu::synchronize();
       correct_tensor_dtype(mutable_tensor, tensor_name);
+      torch::npu::synchronize();
+      LOG(INFO) << "Set_device: " << device;
       if (to_host) {
         at_host_weight_tensors_[weight_position] = mutable_tensor.to(device);
       } else {
         at_weight_tensors_[weight_position] = mutable_tensor.to(device);
       }
+      torch::npu::synchronize();
+      LOG(INFO) << "Set_device finished";
+      if (!mutable_tensor.defined()) {
+        LOG(FATAL) << "Set_weight failed, mutable_tensor" << tensor_name
+                   << " is not defined.";
+      }
+      torch::npu::synchronize();
     }
   }
 }

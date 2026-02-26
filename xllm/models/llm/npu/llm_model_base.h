@@ -19,6 +19,7 @@ limitations under the License.
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
+#include <torch_npu/torch_npu.h>
 
 #include <string>
 #include <typeinfo>
@@ -297,6 +298,9 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
  public:
   LlmForCausalLMImplBase(const ModelContext& context) {
     tie_word_embeddings = context.get_model_args().tie_word_embeddings();
+    multi_lm_head =
+        (context.get_model_args().model_type().find("omni") != string::npos);
+
     // register submodules
     model_ = register_module("model", LlmModelType(context));
 
@@ -328,28 +332,41 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
   virtual void load_model(
       std::unique_ptr<ModelLoader> loader,
       std::string prefix = "model." /*llm model weight prefix*/) {
+    string lm_head_name = (tie_word_embeddings) ? prefix + "embed_tokens"
+                          : (multi_lm_head)     ? prefix + "lm_head"
+                                                : "lm_head";
+    LOG(INFO) << "Loading lm head weight from " << lm_head_name;
+
     for (const auto& state_dict : loader->get_state_dicts()) {
+      VLOG(50) << "Trying load state dict of model_";
       model_->load_state_dict(state_dict->get_dict_with_prefix(prefix));
-      if (tie_word_embeddings) {
-        npu_lm_head_->load_state_dict(
-            state_dict->get_dict_with_prefix(prefix + "embed_tokens."));
-      } else {
-        npu_lm_head_->load_state_dict(
-            state_dict->get_dict_with_prefix("lm_head."));
+      VLOG(50) << "Trying load state dict of " << lm_head_name
+               << " , reuslt is "
+               << state_dict->get_tensor(lm_head_name + ".weight").defined();
+      if (state_dict->get_tensor(lm_head_name + ".weight").defined()) {
+        VLOG(50) << "The shape is "
+                 << state_dict->get_tensor(lm_head_name + ".weight").sizes()
+                 << ".";
       }
+      npu_lm_head_->load_state_dict(
+          state_dict->get_dict_with_prefix(lm_head_name));
     }
+    torch::npu::synchronize();
+    LOG(INFO) << "Finish loading weight, start to verify. ";
 
     // verify
     model_->verify_loaded_weights(prefix);
-    if (tie_word_embeddings) {
-      npu_lm_head_->verify_loaded_weights(prefix + "embed_tokens.");
-    } else {
-      npu_lm_head_->verify_loaded_weights("lm_head.");
-    }
+    // npu_lm_head_->verify_loaded_weights(lm_head_name);
+
+    torch::npu::synchronize();
+    LOG(INFO) << "Finish verify weight, start to merge. ";
 
     model_->merge_loaded_weights();
     // test
-    npu_lm_head_->merge_loaded_weights();
+    // npu_lm_head_->merge_loaded_weights();
+
+    torch::npu::synchronize();
+    LOG(INFO) << "Finish verify weight, start to merge. ";
   }
 
   virtual void prepare_expert_weight(int32_t layer_id,
@@ -376,6 +393,7 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
   LlmModelType model_{nullptr};
   int device_id = 0;
   bool tie_word_embeddings{false};
+  bool multi_lm_head{false};
   // test
   layer::NpuLmHead npu_lm_head_{nullptr};
 };

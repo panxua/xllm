@@ -31,6 +31,9 @@ if(USE_NPU)
   # Override Mooncake option for mooncake transfer engine
   # CANN 8.5+ migration: ascend_direct_transport replaces ascend_transport
   set(USE_ASCEND_DIRECT ON CACHE BOOL "Enable ADXL engine for Ascend NPU" FORCE)
+  set(TRITON_BINARY_PATH "${CMAKE_BINARY_DIR}/triton_kernels"
+	  CACHE PATH "Path to NPU Triton kernel binaries (shared between torch_npu_ops and xllm_atb_layers)")
+  message(STATUS "TRITON_BINARY_PATH = ${TRITON_BINARY_PATH}") 
 
   set(XLLM_ATB_LAYERS_SOURCE_DIR
       "${CMAKE_SOURCE_DIR}/third_party/xllm_atb_layers"

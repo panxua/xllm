@@ -18,7 +18,10 @@ limitations under the License.
 
 #include <gflags/gflags.h>
 
+#include <atomic>
 #include <memory>
+#include <thread>
+#include <vector>
 
 #include "common/macros.h"
 #include "core/distributed_runtime/dist_manager.h"
@@ -41,7 +44,7 @@ class VLMEngine : public Engine {
   VLMEngine(const runtime::Options& options,
             std::shared_ptr<DistManager> dist_manager = nullptr);
 
-  virtual ~VLMEngine() = default;
+  ~VLMEngine() override;
 
   ForwardOutput step(std::vector<Batch>& batch) override;
 
@@ -54,14 +57,21 @@ class VLMEngine : public Engine {
   // return the active activation memory
   std::vector<int64_t> get_active_activation_memory() const override;
 
-  // scheduler related methods TODO(panxuanyu): abstract maybe
-  // bool add_request(std::shared_ptr<Request>& request) override;
-  // void incr_pending_requests(size_t count) override;
-  // void decr_pending_requests() override;
   void step(const absl::Duration& timeout) override;
   void generate() override;
+  void run() override;
+  void stop() override;
 
  private:
+  std::vector<RawForwardOutput> collect_raw_forward_outputs(
+      std::vector<Batch>& batch);
+  void apply_raw_forward_outputs(std::vector<Batch>& batch,
+                                 const std::vector<RawForwardOutput>& outputs,
+                                 bool replace_fake_token);
+
+  void update_last_step_result_from_workers(std::vector<Batch>& last_batch);
+  std::vector<int64_t> collect_active_activation_memory_from_workers() const;
+
   bool init_model();
   Engine::KVCacheCapacity estimate_kv_cache_capacity();
   bool allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap);
@@ -99,6 +109,11 @@ class VLMEngine : public Engine {
   // config for kv cache
   int64_t n_local_kv_heads_ = 0;
   int64_t head_dim_ = 0;
+
+  // loop state for engine-driven scheduling.
+  std::thread loop_thread_;
+  std::atomic_bool stopped_{false};
+  std::atomic_bool running_{false};
 };
 
 }  // namespace xllm

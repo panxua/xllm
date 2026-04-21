@@ -41,6 +41,7 @@ namespace xllm {
 
 FixedStepsScheduler::FixedStepsScheduler(Engine* engine, const Options& options)
     : ContinuousScheduler(engine, options),
+      engine_(engine),
       step_semaphore_(
           static_cast<std::ptrdiff_t>(options.rec_worker_max_concurrency())) {
   step_threadpool_ = std::make_unique<ThreadPool>(

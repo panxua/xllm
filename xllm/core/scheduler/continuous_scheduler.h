@@ -19,6 +19,8 @@ limitations under the License.
 #include <folly/MPMCQueue.h>
 #include <folly/futures/Future.h>
 
+#include <atomic>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <queue>
@@ -41,8 +43,10 @@ namespace xllm {
 class Engine;
 class DecodePriorityQueue;
 
-class ContinuousScheduler : public Scheduler {
+class ContinuousScheduler : public EngineDrivenScheduler {
  public:
+  static constexpr int32_t kDefaultStepTimeoutMs = 500;
+
   struct Options {
     // the maximum number of tokens per batch
     PROPERTY(int32_t, max_tokens_per_batch) = 20000;
@@ -133,6 +137,21 @@ class ContinuousScheduler : public Scheduler {
 
   bool add_request(std::shared_ptr<Request>& request) override;
 
+  // Stage 1: scheduling only, returns the batch to be forwarded by engine.
+  std::vector<Batch> schedule(const absl::Duration& timeout) override;
+
+  // Stage 3: postprocess after engine forward.
+  void process_batch_output(std::vector<Batch>& batch) override;
+  void process_batch_output() override { process_batch_output(false); }
+
+  size_t request_queue_size() const override { return request_queue_.size(); }
+  void wait_response_completion() override {
+    response_processor_->wait_completion();
+  }
+  int32_t default_step_timeout_ms() const override {
+    return kDefaultStepTimeoutMs;
+  }
+
   void step(const absl::Duration& timeout) override;
 
   void generate() override;
@@ -188,9 +207,6 @@ class ContinuousScheduler : public Scheduler {
 
  protected:
   const Options options_;
-
-  // the engine to run the batch
-  Engine* engine_;
 
   KVCacheManager* kv_cache_manager_;
 
@@ -318,6 +334,8 @@ class ContinuousScheduler : public Scheduler {
 
   // process the batch output
   void process_batch_output(bool enable_schedule_overlap);
+  void advance_batch_state(std::vector<Batch>& batch,
+                           bool current_batch_executed);
 
   void step_with_schedule_overlap(const absl::Duration& timeout);
 

@@ -20,6 +20,7 @@ limitations under the License.
 #include <folly/MPMCQueue.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -91,19 +92,25 @@ inline size_t maybe_align_cp_prefill_tokens(const Sequence* sequence,
   return xllm::util::align_up(num_tokens, alignment);
 }
 
+inline bool all_batches_empty(const std::vector<Batch>& batch) {
+  return std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
+    return one_batch.empty();
+  });
+}
+
 }  // namespace
 
 ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
     : options_(options),
-      engine_(engine),
       request_queue_(FLAGS_request_queue_size),
       waiting_priority_queue_(create_comparator(options.priority_strategy())),
       waiting_priority_queue_offline_(
           create_comparator(options.priority_strategy())) {
-  CHECK(engine_ != nullptr);
-
-  kv_cache_manager_ = engine_->block_manager_pool();
+  CHECK(engine != nullptr);
+  kv_cache_manager_ = engine->block_manager_pool();
+  const Tokenizer* scheduler_tokenizer = engine->tokenizer();
   CHECK(kv_cache_manager_ != nullptr);
+  CHECK(scheduler_tokenizer != nullptr);
 
   enable_prefix_cache_ = FLAGS_enable_prefix_cache;
 
@@ -123,7 +130,7 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
       std::make_unique<ProfileManager>(engine, profile_manager_options);
 
   response_processor_ = std::make_unique<AsyncResponseProcessor>(
-      engine_->tokenizer(),
+      scheduler_tokenizer,
       options_.instance_role(),
       options_.enable_service_routing());
   create_running_queue(options);
@@ -136,8 +143,8 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
     }
     xservice_client_->set_scheduler(this);
     if (FLAGS_enable_xtensor && !options_.enable_disagg_pd()) {
-      xservice_client_->set_engine(engine_);
-      engine_->get_device_info(instance_info_.device_ips, instance_info_.ports);
+      xservice_client_->set_engine(engine);
+      engine->get_device_info(instance_info_.device_ips, instance_info_.ports);
     }
   }
 
@@ -150,6 +157,17 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
   } else {
     min_speculative_tokens_required_ = options_.num_speculative_tokens();
   }
+  EngineDrivenScheduler::RuntimeOps runtime_ops;
+  runtime_ops.run_forward_batch = [engine](std::vector<Batch>& batch) {
+    engine->step(batch);
+  };
+  runtime_ops.update_last_forward_result = [engine](std::vector<Batch>& batch) {
+    engine->update_last_step_result(batch);
+  };
+  runtime_ops.get_active_activation_memory = [engine]() {
+    return engine->get_active_activation_memory();
+  };
+  set_runtime_ops(std::move(runtime_ops));
 }
 
 ContinuousScheduler::~ContinuousScheduler() { running_requests_.clear(); }
@@ -1053,6 +1071,52 @@ std::vector<Batch> ContinuousScheduler::schedule_request(
   return batch;
 }
 
+std::vector<Batch> ContinuousScheduler::schedule(
+    const absl::Duration& timeout) {
+  return schedule_request(timeout);
+}
+
+void ContinuousScheduler::process_batch_output(std::vector<Batch>& batch) {
+  advance_batch_state(batch, !all_batches_empty(batch));
+}
+
+void ContinuousScheduler::advance_batch_state(std::vector<Batch>& batch,
+                                              bool current_batch_executed) {
+  const bool cur_batch_all_empty = all_batches_empty(batch);
+  if (!options_.enable_schedule_overlap()) {
+    if (!current_batch_executed || cur_batch_all_empty) {
+      return;
+    }
+    kv_cache_manager_->reset_transfer_infos();
+    process_batch_output(false);
+    return;
+  }
+
+  const bool last_batch_all_empty = all_batches_empty(last_batch_);
+  if (cur_batch_all_empty && last_batch_all_empty) {
+    return;
+  }
+
+  if (!cur_batch_all_empty) {
+    CHECK(current_batch_executed)
+        << "Current batch is non-empty but was not executed.";
+  }
+  if (current_batch_executed) {
+    kv_cache_manager_->reset_transfer_infos();
+  }
+
+  // producer-consumer mode, make sure only one step is scheduled in advance.
+  if (!is_first_step_ && !last_batch_all_empty) {
+    update_last_forward_result(last_batch_);
+    process_batch_output(true);
+  }
+
+  last_batch_ = std::move(batch);
+  last_running_sequences_ = running_sequences_;
+  last_running_requests_ = running_requests_;
+  is_first_step_ = false;
+}
+
 // step the scheduler forward by one step
 // may get blocked if there are no requests to process
 void ContinuousScheduler::step(const absl::Duration& timeout) {
@@ -1069,14 +1133,11 @@ void ContinuousScheduler::step(const absl::Duration& timeout) {
     }
 
     if (!options_.enable_pd_ooc()) {
-      engine_->step(batch);
+      run_forward_batch(batch);
     } else {
       step_with_pd_ooc(batch);
     }
-
-    kv_cache_manager_->reset_transfer_infos();
-    // process request output in batch
-    process_batch_output(false);
+    advance_batch_state(batch, true /*current_batch_executed*/);
   } else {
     step_with_schedule_overlap(timeout);
   }
@@ -1090,28 +1151,11 @@ void ContinuousScheduler::step_with_schedule_overlap(
       std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
         return one_batch.empty();
       });
-  bool last_batch_all_empty = std::all_of(
-      last_batch_.begin(), last_batch_.end(), [](const Batch& one_batch) {
-        return one_batch.empty();
-      });
-  if (cur_batch_all_empty && last_batch_all_empty) {
-    return;
-  }
 
   if (!cur_batch_all_empty) {
-    engine_->step(batch);
-    kv_cache_manager_->reset_transfer_infos();
+    run_forward_batch(batch);
   }
-
-  // producer-consumer mode, make sure only one step is scheduled in advance
-  if (!is_first_step_ && !last_batch_all_empty) {
-    engine_->update_last_step_result(last_batch_);
-    process_batch_output(true);
-  }
-  last_batch_ = std::move(batch);
-  last_running_sequences_ = running_sequences_;
-  last_running_requests_ = running_requests_;
-  is_first_step_ = false;
+  advance_batch_state(batch, !cur_batch_all_empty /*current_batch_executed*/);
 }
 
 void ContinuousScheduler::generate() {
@@ -1119,7 +1163,7 @@ void ContinuousScheduler::generate() {
   while (num_pending_requests() > 0 || !batch_empty ||
          request_queue_.size() > 0) {
     // build a batch of requests/sequences
-    const auto timeout = absl::Milliseconds(500);
+    const auto timeout = absl::Milliseconds(kDefaultStepTimeoutMs);
     std::vector<Batch> batch = schedule_request(timeout);
     batch_empty = true;
     for (auto& b : batch) {
@@ -1130,11 +1174,8 @@ void ContinuousScheduler::generate() {
     }
 
     // run inference for the batch
-    engine_->step(batch);
-    kv_cache_manager_->reset_transfer_infos();
-
-    // process request output in batch
-    process_batch_output(false);
+    run_forward_batch(batch);
+    advance_batch_state(batch, true /*current_batch_executed*/);
   }
 
   // wait for all responses done
@@ -1251,11 +1292,17 @@ std::vector<int64_t> ContinuousScheduler::get_num_occupied_slots(
 
 std::vector<int64_t> ContinuousScheduler::get_active_activation_in_bytes() {
   std::vector<int64_t> all_active_activation_in_bytes =
-      engine_->get_active_activation_memory();
+      get_active_activation_memory_from_runtime();
   std::vector<int64_t> active_activation_in_bytes(options_.dp_size());
 
+  if (all_active_activation_in_bytes.empty()) {
+    return active_activation_in_bytes;
+  }
   const int32_t dp_local_tp_size =
       all_active_activation_in_bytes.size() / options_.dp_size();
+  if (dp_local_tp_size <= 0) {
+    return active_activation_in_bytes;
+  }
 
   for (int32_t dp_rank = 0; dp_rank < options_.dp_size(); ++dp_rank) {
     active_activation_in_bytes[dp_rank] =
@@ -1314,7 +1361,7 @@ void ContinuousScheduler::step_with_pd_ooc(std::vector<Batch>& batch) {
   }
 
   auto start = std::chrono::high_resolution_clock::now();
-  engine_->step(batch);
+  run_forward_batch(batch);
   auto end = std::chrono::high_resolution_clock::now();
   double duration_ms =
       std::chrono::duration_cast<std::chrono::microseconds>(end - start)

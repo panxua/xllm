@@ -116,6 +116,8 @@ class FixedStepsScheduler final : public ContinuousScheduler {
       size_t& remaining_seq_budget,
       std::vector<std::shared_ptr<Request>>& finished_requests);
 
+  Engine* engine_;
+
   // Lazy-initialized pipeline
   std::unique_ptr<SchedulerPipeline> scheduler_pipeline_;
 

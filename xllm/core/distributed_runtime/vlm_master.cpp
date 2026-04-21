@@ -18,9 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <pybind11/pybind11.h>
 
-#include <atomic>
 #include <memory>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -88,13 +86,7 @@ VLMMaster::VLMMaster(const Options& options)
       std::make_unique<ThreadPool>(options_.num_request_handling_threads());
 }
 
-VLMMaster::~VLMMaster() {
-  stoped_.store(true, std::memory_order_relaxed);
-  // wait for the loop thread to finish
-  if (loop_thread_.joinable()) {
-    loop_thread_.join();
-  }
-}
+VLMMaster::~VLMMaster() { engine_->stop(); }
 
 void VLMMaster::handle_request(std::string prompt,
                                MMData mm_data,
@@ -146,8 +138,7 @@ void VLMMaster::handle_request(std::vector<Message> messages,
                                std::string payload,
                                OutputCallback callback) {
   engine_->incr_pending_requests(1);
-  auto cb = [callback = std::move(callback),
-             scheduler = engine_.get()](const RequestOutput& output) {
+  auto cb = [callback = std::move(callback)](const RequestOutput& output) {
     output.log_request_status();
     return callback(output);
   };
@@ -186,6 +177,8 @@ void VLMMaster::handle_batch_request(std::vector<std::string> prompts,
                                      std::vector<MMData> mm_datas,
                                      std::vector<RequestParams> sps,
                                      BatchOutputCallback callback) {
+  CHECK(prompts.size() == mm_datas.size())
+      << "Number of prompts and mm_datas should be the same";
   CHECK(prompts.size() == sps.size() || sps.size() == 1)
       << "Number of prompts and sampling parameters should be the same";
 
@@ -254,36 +247,13 @@ void VLMMaster::handle_batch_request(
   }
 }
 
-void VLMMaster::run() {
-  const bool already_running = running_.load(std::memory_order_relaxed);
-  if (already_running) {
-    LOG(WARNING) << "VLMMaster is already running.";
-    return;
-  }
-
-  running_.store(true, std::memory_order_relaxed);
-  loop_thread_ = std::thread([this]() {
-    running_.store(true, std::memory_order_relaxed);
-    const auto timeout = absl::Milliseconds(500);
-    while (!stoped_.load(std::memory_order_relaxed)) {
-      engine_->step(timeout);
-    }
-    running_.store(false, std::memory_order_relaxed);
-  });
-}
+void VLMMaster::run() { engine_->run(); }
 
 void VLMMaster::generate() {
   DCHECK(options_.enable_schedule_overlap())
       << "Mode generate does not support schedule overlap yet.";
-  const bool already_running = running_.load(std::memory_order_relaxed);
-  if (already_running) {
-    LOG(WARNING) << "Generate is already running.";
-    return;
-  }
 
-  running_.store(true, std::memory_order_relaxed);
   engine_->generate();
-  running_.store(false, std::memory_order_relaxed);
 }
 
 std::shared_ptr<Request> VLMMaster::generate_request(std::string prompt,

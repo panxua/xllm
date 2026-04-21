@@ -40,7 +40,9 @@ limitations under the License.
 namespace xllm {
 
 DisaggPDScheduler::DisaggPDScheduler(Engine* engine, const Options& options)
-    : ContinuousScheduler(engine, options), server_name_("DisaggPDServer") {
+    : ContinuousScheduler(engine, options),
+      server_name_("DisaggPDServer"),
+      engine_(engine) {
   if (!options_.instance_role().has_value()) {
     LOG(FATAL) << "Instance type is not set in disagg pd mode.";
   }

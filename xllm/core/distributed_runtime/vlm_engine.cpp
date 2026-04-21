@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <absl/strings/str_format.h>
 #include <absl/time/clock.h>
+#include <absl/time/time.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -25,6 +26,7 @@ limitations under the License.
 #include <boost/algorithm/string.hpp>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 
 #include "common/device_monitor.h"
@@ -39,8 +41,8 @@ limitations under the License.
 #include "runtime/worker.h"
 #include "runtime/xservice_client.h"
 #include "scheduler/scheduler_factory.h"
-#include "util/env_var.h"
 #include "util/pretty_print.h"
+#include "util/scope_guard.h"
 #include "util/utils.h"
 namespace xllm {
 
@@ -76,6 +78,8 @@ VLMEngine::VLMEngine(const runtime::Options& options,
   // init thread pool
   threadpool_ = std::make_unique<ThreadPool>(16);
 }
+
+VLMEngine::~VLMEngine() { stop(); }
 
 void VLMEngine::process_group_test() {
 #if !defined(USE_NPU)
@@ -131,6 +135,8 @@ bool VLMEngine::init() {
       .enable_schedule_overlap(options_.enable_schedule_overlap())
       .server_idx(options_.server_idx());
   scheduler_ = create_continuous_scheduler(this, scheduler_options);
+  CHECK(dynamic_cast<EngineDrivenScheduler*>(scheduler_.get()) != nullptr)
+      << "VLMEngine requires EngineDrivenScheduler";
 
   if (options_.enable_service_routing()) {
     auto& instance_info = scheduler_->get_instance_info();
@@ -336,13 +342,13 @@ bool VLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
   return true;
 }
 
-// TODO: support dp batches later
-ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
+std::vector<RawForwardOutput> VLMEngine::collect_raw_forward_outputs(
+    std::vector<Batch>& batch) {
   if (worker_clients_.empty()) {
     // empty worker, return
     return {};
   }
-  Timer timer;
+
   DCHECK(dp_size_ == batch.size())
       << "Split DP batch failed with dp_size as " << dp_size_
       << " and actual batch size as " << batch.size() << ".";
@@ -367,7 +373,8 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
   auto results = folly::collectAll(futures).get();
 
   assert(dp_size_ == worker_clients_num_ / dp_local_tp_size_);
-  size_t dp_rank = 0;
+  std::vector<RawForwardOutput> raw_forward_outputs;
+  raw_forward_outputs.reserve(dp_size_);
   for (auto worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += dp_local_tp_size_) {
     auto result = results[worker_rank].value();
@@ -375,30 +382,36 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
       if (result.value().outputs.empty() && layer_forward_interrupted_) {
         throw ForwardInterruptedException();
       }
-      // if src_seq_idxes is not empty, skip sample output processing and
-      // process beam search output instead
-      if (result.value().src_seq_idxes.size() == 0) {
-        // set second input param enable_schedule_overlap to false,
-        // if it's not enabled, process_sample_output will append the real
-        // token, if it's enabled, this false here will append the fake token in
-        // process_sample_output
-        batch[dp_rank].process_sample_output(result.value(), false);
-      } else {
-        batch[dp_rank].process_beam_search_output(result.value(), false);
-      }
-      // Keep Batch::sequences_ aligned with SequencesGroup after beam updates.
-      batch[dp_rank].refresh_sequences_from_groups();
+      raw_forward_outputs.emplace_back(std::move(result.value()));
     } else {
       LOG(FATAL) << "Failed to execute model, result has no value";
     }
-    ++dp_rank;
   }
-
-  COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
-  return {};
+  return raw_forward_outputs;
 }
 
-void VLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
+void VLMEngine::apply_raw_forward_outputs(
+    std::vector<Batch>& batch,
+    const std::vector<RawForwardOutput>& outputs,
+    bool replace_fake_token) {
+  CHECK_EQ(batch.size(), outputs.size())
+      << "Batch size and raw forward output size mismatch: " << batch.size()
+      << " vs " << outputs.size();
+
+  for (size_t dp_rank = 0; dp_rank < batch.size(); ++dp_rank) {
+    const auto& one_output = outputs[dp_rank];
+    if (one_output.src_seq_idxes.empty()) {
+      batch[dp_rank].process_sample_output(one_output, replace_fake_token);
+    } else {
+      batch[dp_rank].process_beam_search_output(one_output, replace_fake_token);
+    }
+    // Keep Batch::sequences_ aligned with SequencesGroup after beam updates.
+    batch[dp_rank].refresh_sequences_from_groups();
+  }
+}
+
+void VLMEngine::update_last_step_result_from_workers(
+    std::vector<Batch>& last_batch) {
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
   std::vector<RawForwardOutput> raw_forward_outputs;
@@ -428,12 +441,8 @@ void VLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
     }
   }
 
-  for (auto i = 0; i < last_batch.size(); i++) {
-    last_batch[i].process_sample_output(raw_forward_outputs[i],
-                                        options_.enable_schedule_overlap());
-    // Keep Batch::sequences_ aligned with SequencesGroup after beam updates.
-    last_batch[i].refresh_sequences_from_groups();
-  }
+  apply_raw_forward_outputs(
+      last_batch, raw_forward_outputs, options_.enable_schedule_overlap());
 }
 
 void VLMEngine::setup_workers(const runtime::Options& options) {
@@ -443,7 +452,8 @@ void VLMEngine::setup_workers(const runtime::Options& options) {
   worker_clients_ = dist_manager_->get_worker_clients();
 }
 
-std::vector<int64_t> VLMEngine::get_active_activation_memory() const {
+std::vector<int64_t> VLMEngine::collect_active_activation_memory_from_workers()
+    const {
   // call worker to get active activation memory
   std::vector<folly::SemiFuture<int64_t>> futures;
   futures.reserve(worker_clients_num_);
@@ -459,6 +469,114 @@ std::vector<int64_t> VLMEngine::get_active_activation_memory() const {
     active_activation_memories.push_back(result.value());
   }
   return active_activation_memories;
+}
+
+ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
+  if (worker_clients_.empty()) {
+    return {};
+  }
+  Timer timer;
+  const auto raw_forward_outputs = collect_raw_forward_outputs(batch);
+  apply_raw_forward_outputs(batch, raw_forward_outputs, false);
+
+  COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
+  return {};
+}
+
+void VLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
+  update_last_step_result_from_workers(last_batch);
+}
+
+std::vector<int64_t> VLMEngine::get_active_activation_memory() const {
+  return collect_active_activation_memory_from_workers();
+}
+
+void VLMEngine::step(const absl::Duration& timeout) {
+  auto* scheduler = dynamic_cast<EngineDrivenScheduler*>(scheduler_.get());
+  CHECK(scheduler != nullptr) << "VLMEngine requires EngineDrivenScheduler";
+  std::vector<Batch> batch = scheduler->schedule(timeout);
+  const bool batch_empty =
+      std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
+        return one_batch.empty();
+      });
+  if (!batch_empty) {
+    step(batch);
+  }
+  scheduler->process_batch_output(batch);
+}
+
+void VLMEngine::run() {
+  bool expected = false;
+  if (!running_.compare_exchange_strong(expected,
+                                        true,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_relaxed)) {
+    LOG(WARNING) << "VLMEngine is already running.";
+    return;
+  }
+
+  stopped_.store(false, std::memory_order_release);
+  try {
+    loop_thread_ = std::thread([this]() {
+      SCOPE_GUARD([this] { running_.store(false, std::memory_order_release); });
+      try {
+        auto* scheduler =
+            dynamic_cast<EngineDrivenScheduler*>(scheduler_.get());
+        CHECK(scheduler != nullptr)
+            << "VLMEngine requires EngineDrivenScheduler";
+        const auto timeout =
+            absl::Milliseconds(scheduler->default_step_timeout_ms());
+        while (!stopped_.load(std::memory_order_acquire)) {
+          step(timeout);
+        }
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "VLMEngine loop exits on exception: " << e.what();
+      } catch (...) {
+        LOG(ERROR) << "VLMEngine loop exits on unknown exception.";
+      }
+    });
+  } catch (...) {
+    running_.store(false, std::memory_order_release);
+    throw;
+  }
+}
+
+void VLMEngine::stop() {
+  stopped_.store(true, std::memory_order_release);
+  if (loop_thread_.joinable()) {
+    loop_thread_.join();
+  }
+  running_.store(false, std::memory_order_release);
+}
+
+void VLMEngine::generate() {
+  bool expected = false;
+  if (!running_.compare_exchange_strong(expected,
+                                        true,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_relaxed)) {
+    LOG(WARNING) << "Generate is already running.";
+    return;
+  }
+  SCOPE_GUARD([this] { running_.store(false, std::memory_order_release); });
+
+  auto* scheduler = dynamic_cast<EngineDrivenScheduler*>(scheduler_.get());
+  CHECK(scheduler != nullptr) << "VLMEngine requires EngineDrivenScheduler";
+  const auto timeout = absl::Milliseconds(scheduler->default_step_timeout_ms());
+  bool batch_empty = false;
+  while (scheduler->num_pending_requests() > 0 || !batch_empty ||
+         scheduler->request_queue_size() > 0) {
+    std::vector<Batch> batch = scheduler->schedule(timeout);
+    batch_empty =
+        std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
+          return one_batch.empty();
+        });
+    if (!batch_empty) {
+      step(batch);
+    }
+    scheduler->process_batch_output(batch);
+  }
+  scheduler->wait_response_completion();
 }
 
 std::vector<RawForwardInput> VLMEngine::prepare_inputs(
@@ -498,25 +616,5 @@ std::vector<RawForwardInput> VLMEngine::prepare_inputs(
 
   return batched_inputs;
 }
-
-/*
-bool VLMEngine::add_request(std::shared_ptr<Request>& request) {
-  return scheduler_->add_request(request);
-}
-
-void VLMEngine::incr_pending_requests(size_t count) {
-  scheduler_->incr_pending_requests(count);
-}
-
-void VLMEngine::decr_pending_requests() {
-  scheduler_->decr_pending_requests();
-}
-*/
-
-void VLMEngine::step(const absl::Duration& timeout) {
-  scheduler_->step(timeout);
-}
-
-void VLMEngine::generate() { scheduler_->generate(); }
 
 }  // namespace xllm

@@ -180,6 +180,8 @@ class DisaggPDScheduler : public ContinuousScheduler {
   std::unordered_set<std::string> linked_instance_;
 
   std::string server_name_;
+
+  Engine* engine_;
 };
 
 }  // namespace xllm

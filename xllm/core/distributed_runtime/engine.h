@@ -207,6 +207,14 @@ class Engine {
     CHECK(scheduler_);
     scheduler_->generate();
   }
+  virtual void run() {
+    CHECK(scheduler_);
+    scheduler_->run();
+  }
+  virtual void stop() {
+    CHECK(scheduler_);
+    scheduler_->stop();
+  }
 
  protected:
   // model args

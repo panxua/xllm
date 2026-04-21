@@ -21,7 +21,6 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
-#include <thread>
 #include <variant>
 #include <vector>
 
@@ -43,7 +42,7 @@ class ImageProcessor;
 class VLMMaster : public Master {
  public:
   explicit VLMMaster(const Options& options);
-  ~VLMMaster();
+  ~VLMMaster() override;
 
   // completion
   void handle_request(std::string prompt,
@@ -115,15 +114,6 @@ class VLMMaster : public Master {
   std::unique_ptr<InputProcessor> input_processor_;
 
   std::unique_ptr<ImageProcessor> image_processor_;
-
-  // thread for moving forward the scheduler
-  std::thread loop_thread_;
-
-  // flag to stop the loop
-  std::atomic_bool stoped_{false};
-
-  // flag to indicate if the handler is running
-  std::atomic_bool running_{false};
 };
 
 }  // namespace xllm

@@ -272,19 +272,12 @@ struct W8A8LinearParamRefs {
 
 void ensure_w8a8_params_for_linear_load(
     torch::nn::Module* module,
+    const QuantArgs& quant_args,
     const torch::TensorOptions& options,
     const std::optional<std::string>& resolved_weight_quant_method,
     int64_t shared_input_param_size,
     W8A8LinearParamRefs refs) {
-  if (!is_w8a8_quant(resolved_weight_quant_method) &&
-      !is_w8a8_dynamic_quant(resolved_weight_quant_method)) {
-    return;
-  }
-  CHECK(refs.weight.defined())
-      << "weight must be registered before lazy quant init";
-
   std::vector<weight::LazyParameterSpec> specs;
-  specs.reserve(5);
   const int64_t out_features = refs.weight.size(0);
   const int64_t in_features = refs.weight.size(1);
   auto push = [&](torch::Tensor& tensor,
@@ -296,11 +289,29 @@ void ensure_w8a8_params_for_linear_load(
         &tensor, &tensor_is_loaded, name, std::move(sizes), tensor_options});
   };
 
-  push(refs.weight,
-       refs.weight_is_loaded,
-       "weight",
-       {out_features, in_features},
-       options.dtype(torch::kInt8));
+  if (!is_w8a8_quant(resolved_weight_quant_method) &&
+      !is_w8a8_dynamic_quant(resolved_weight_quant_method)) {
+    if (!quant_args.quant_descs().empty()) {
+      // quant_descs is not empty but the resolved quant method is not
+      // w8a8_dynamic (e.g., no quant method resolved, or a non-quantized
+      // checkpoint). The weights were initialized as kInt8 in the constructor;
+      // re-register them back to the original dtype so that the subsequent
+      // load_experts can copy the checkpoint weights correctly.
+      specs.reserve(1);
+      push(refs.weight,
+          refs.weight_is_loaded,
+          "weight",
+          {out_features, in_features},
+          options);
+      weight::ensure_parameter_storage(module, specs);
+    }
+    return;
+  }
+
+  CHECK(refs.weight.defined())
+      << "weight must be registered before lazy quant init";
+
+  specs.reserve(4);
   if (is_w8a8_quant(resolved_weight_quant_method)) {
     push(refs.input_scale,
          refs.input_scale_is_loaded,
@@ -531,6 +542,15 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(
                              torch::empty({1}, options.dtype(torch::kFloat32)),
                              /*requires_grad=*/false);
     }
+  } else if (!quant_args_.quant_descs().empty()) {
+    // quant_descs is not empty: default initialize weight as kInt8.
+    // During load_state_dict, the weight will be lazily re-registered to the
+    // appropriate dtype based on the resolved quant method.
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features_per_partition, in_features},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
   } else {
     weight_ = register_parameter(
         "weight",
@@ -651,6 +671,7 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
   ensure_w8a8_params_for_linear_load(
       this,
+      quant_args_,
       options_,
       resolved_weight_quant_method_,
       /*shared_input_param_size=*/1,
@@ -716,6 +737,7 @@ void ColumnParallelLinearImpl::load_state_dict(
       quant_args_, state_dict, &prefixes, resolved_weight_quant_method_);
   ensure_w8a8_params_for_linear_load(
       this,
+      quant_args_,
       options_,
       resolved_weight_quant_method_,
       /*shared_input_param_size=*/1,
@@ -852,6 +874,7 @@ void ColumnParallelLinearImpl::load_state_dict(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
   ensure_w8a8_params_for_linear_load(
       this,
+      quant_args_,
       options_,
       resolved_weight_quant_method_,
       /*shared_input_param_size=*/1,
@@ -953,6 +976,15 @@ QKVParallelLinearImpl::QKVParallelLinearImpl(
                              torch::empty({3}, options.dtype(torch::kFloat32)),
                              /*requires_grad=*/false);
     }
+  } else if (!quant_args_.quant_descs().empty()) {
+    // quant_descs is not empty: default initialize weight as kInt8.
+    // During load_state_dict, the weight will be lazily re-registered to the
+    // appropriate dtype based on the resolved quant method.
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features_per_partition, hidden_size},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
   } else {
     weight_ = register_parameter(
         "weight",
@@ -1036,6 +1068,7 @@ void QKVParallelLinearImpl::load_state_dict(
       quant_args_, state_dict, &prefixes, resolved_weight_quant_method_);
   ensure_w8a8_params_for_linear_load(
       this,
+      quant_args_,
       options_,
       resolved_weight_quant_method_,
       /*shared_input_param_size=*/1,
@@ -1138,6 +1171,7 @@ void QKVParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
   ensure_w8a8_params_for_linear_load(
       this,
+      quant_args_,
       options_,
       resolved_weight_quant_method_,
       /*shared_input_param_size=*/1,
@@ -1252,6 +1286,15 @@ RowParallelLinearImpl::RowParallelLinearImpl(
                              torch::empty({1}, options.dtype(torch::kFloat32)),
                              /*requires_grad=*/false);
     }
+  } else if (!quant_args_.quant_descs().empty()) {
+    // quant_descs is not empty: default initialize weight as kInt8.
+    // During load_state_dict, the weight will be lazily re-registered to the
+    // appropriate dtype based on the resolved quant method.
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features, in_features_per_partition},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
   } else {
     weight_ = register_parameter(
         "weight",
@@ -1388,6 +1431,7 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
   ensure_w8a8_params_for_linear_load(
       this,
+      quant_args_,
       options_,
       resolved_weight_quant_method_,
       /*shared_input_param_size=*/1,
@@ -1456,10 +1500,21 @@ ReplicatedLinearImpl::ReplicatedLinearImpl(
     const LinearExtraArgs& linear_extra_args)
     : quant_args_(quant_args), options_(options) {
   (void)linear_extra_args;
-  weight_ =
-      register_parameter("weight",
-                         torch::empty({out_features, in_features}, options),
-                         /*requires_grad=*/false);
+  if (!quant_args_.quant_descs().empty()) {
+    // quant_descs is not empty: default initialize weight as kInt8.
+    // During load_state_dict, the weight will be lazily re-registered to the
+    // appropriate dtype based on the resolved quant method.
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features, in_features},
+                     options.dtype(torch::kInt8)),
+                     /*requires_grad=*/false);
+  } else {
+    weight_ =
+        register_parameter("weight",
+                          torch::empty({out_features, in_features}, options),
+                          /*requires_grad=*/false);
+  }
 
   if (bias) {
     bias_ = register_parameter("bias",
@@ -1598,6 +1653,7 @@ void ReplicatedLinearImpl::load_state_dict(const StateDict& state_dict) {
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
   ensure_w8a8_params_for_linear_load(
       this,
+      quant_args_,
       options_,
       resolved_weight_quant_method_,
       /*shared_input_param_size=*/1,

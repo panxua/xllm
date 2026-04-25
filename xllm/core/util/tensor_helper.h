@@ -77,6 +77,35 @@ inline torch::Tensor load_tensor(std::string filename) {
   return my_tensor;
 }
 
+/**
+ * @brief Save tensor with auto NPU device index in filename (like torch.save)
+ * @param tensor Input tensor (CPU/NPU)
+ * @param save_path Save file path
+ * @demo save_tensor(tensor, "path/out.pt");
+ */
+inline void save_tensor(const torch::Tensor& tensor, const std::string& save_path) {
+    int device_index;
+
+    // Get NPU device index: if CPU, create temp tensor on NPU
+    if (tensor.device().is_cpu()) {
+        torch::Tensor tmp = torch::empty(1).to("npu");
+        device_index = tmp.device().index();
+    } else {
+        device_index = tensor.device().index();
+    }
+
+    // Build filename with _dev{index} suffix
+    fs::path p(save_path);
+    std::string fname = p.stem().string() + "_dev" + std::to_string(device_index) + p.extension().string();
+    fs::path final_path = p.parent_path() / fname;
+
+    // Move to CPU and make contiguous before saving
+    torch::Tensor cpu_tensor = tensor.to(torch::kCPU).contiguous();
+
+    // Save tensor as pickle format
+    save_tensor_as_pickle(cpu_tensor, final_path.string());
+}
+
 inline void print_tensor(
     const torch::Tensor& tensor,
     const std::string& tensor_name = "tensor",

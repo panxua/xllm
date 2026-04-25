@@ -54,6 +54,9 @@ class FusedMoEImpl : public torch::nn::Module {
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const ModelInputParams& input_params);
   void load_state_dict(const StateDict& state_dict);
+  const torch::Tensor& debug_last_shared_output_pre() const;
+  const torch::Tensor& debug_last_shared_gate() const;
+  const torch::Tensor& debug_last_shared_output() const;
 
  private:
   // struct to store the selected expert info
@@ -88,6 +91,9 @@ class FusedMoEImpl : public torch::nn::Module {
   std::string scoring_func_;
   std::optional<std::string> resolved_moe_quant_method_;
   std::optional<std::pair<torch::Tensor, torch::Tensor>> preselected_experts_;
+  torch::Tensor debug_last_shared_output_pre_;
+  torch::Tensor debug_last_shared_gate_;
+  torch::Tensor debug_last_shared_output_;
 
   int64_t num_experts_per_rank_;
   int64_t start_expert_id_;

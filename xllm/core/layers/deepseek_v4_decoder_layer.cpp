@@ -402,6 +402,15 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   dump_moe_tensor("topk_ids.output", topk_ids);
   ffn_input = moe_mlp_->forward_with_selected_experts(
       ffn_input, topk_weights, topk_ids, input_params);
+  const auto& shared_output_pre = moe_mlp_->debug_last_shared_output_pre();
+  const auto& shared_gate = moe_mlp_->debug_last_shared_gate();
+  const auto& shared_output = moe_mlp_->debug_last_shared_output();
+  log_moe_tensor("shared_output_pre.output", shared_output_pre);
+  log_moe_tensor("shared_gate.output", shared_gate);
+  log_moe_tensor("shared_output.output", shared_output);
+  dump_moe_tensor("shared_output_pre.output", shared_output_pre);
+  dump_moe_tensor("shared_gate.output", shared_gate);
+  dump_moe_tensor("shared_output.output", shared_output);
   log_moe_tensor("moe_output.output", ffn_input);
   dump_moe_tensor("moe_output.output", ffn_input);
   x = hc_post(ffn_input, residual_ffn, post_ffn, comb_ffn);

@@ -262,6 +262,18 @@ bool load_fused_down_scale_fallback(const StateDict& state_dict,
 
 }  // namespace
 
+const torch::Tensor& FusedMoEImpl::debug_last_shared_output_pre() const {
+  return debug_last_shared_output_pre_;
+}
+
+const torch::Tensor& FusedMoEImpl::debug_last_shared_gate() const {
+  return debug_last_shared_gate_;
+}
+
+const torch::Tensor& FusedMoEImpl::debug_last_shared_output() const {
+  return debug_last_shared_output_;
+}
+
 FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
                            const FusedMoEArgs& moe_args,
                            const QuantArgs& quant_args,
@@ -688,14 +700,24 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
   }
 
   std::optional<torch::Tensor> shared_output = std::nullopt;
+  debug_last_shared_output_pre_ = torch::Tensor();
+  debug_last_shared_gate_ = torch::Tensor();
+  debug_last_shared_output_ = torch::Tensor();
   if (n_shared_experts_ > 0) {
     shared_output = shared_experts_(input);
+    if (shared_output.has_value()) {
+      debug_last_shared_output_pre_ = shared_output.value();
+    }
     if (shared_expert_gate_) {
       auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
+      debug_last_shared_gate_ = gate;
       if (shared_output.has_value()) {
         torch::Tensor res = gate * shared_output.value();
         shared_output = res;
       }
+    }
+    if (shared_output.has_value()) {
+      debug_last_shared_output_ = shared_output.value();
     }
   }
   auto router_logits = gate_(input);
@@ -750,14 +772,24 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
       std::make_pair(weights_2d.to(input.dtype()), ids_2d.to(torch::kInt32));
 
   std::optional<torch::Tensor> shared_output = std::nullopt;
+  debug_last_shared_output_pre_ = torch::Tensor();
+  debug_last_shared_gate_ = torch::Tensor();
+  debug_last_shared_output_ = torch::Tensor();
   if (n_shared_experts_ > 0) {
     shared_output = shared_experts_(input);
+    if (shared_output.has_value()) {
+      debug_last_shared_output_pre_ = shared_output.value();
+    }
     if (shared_expert_gate_) {
       auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
+      debug_last_shared_gate_ = gate;
       if (shared_output.has_value()) {
         torch::Tensor res = gate * shared_output.value();
         shared_output = res;
       }
+    }
+    if (shared_output.has_value()) {
+      debug_last_shared_output_ = shared_output.value();
     }
   }
 

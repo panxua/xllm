@@ -28,6 +28,7 @@ limitations under the License.
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
+#include "xllm/core/util/tensor_helper.h"
 
 namespace xllm {
 namespace layer {
@@ -1473,6 +1474,8 @@ torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input,
   auto bias =
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
   torch::Tensor output;
+  LOG(INFO) << "======================resolved_weight_quant_method_ : "
+            << resolved_weight_quant_method_;
   if (is_w8a8_quant(resolved_weight_quant_method_)) {
     CHECK(input_scale_is_loaded_ && input_scale_.defined())
         << "input_scale is required for w8a8 quant matmul.";
@@ -1537,7 +1540,7 @@ torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input,
         dump_tensor = dump_tensor.contiguous();
         const std::string path =
             dump_dir + "/" + sanitize_dump_name(dump_name) + ".pt";
-        torch::save(dump_tensor, path);
+        save_tensor_as_pickle(dump_tensor, path);
       } catch (const c10::Error& e) {
         LOG(WARNING) << "[ReplicatedLinearDump] failed to save tensor "
                      << dump_name << " in " << dump_dir << ": " << e.what();

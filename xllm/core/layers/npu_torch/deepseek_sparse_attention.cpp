@@ -188,7 +188,28 @@ void dump_rope_tensor(const std::string& layer_dir,
   if (layer_dir.empty() || !tensor.defined()) {
     return;
   }
-  const auto path = layer_dir + "/" + sanitize_dump_name(name) + ".pt";
+  std::string module_name = "misc";
+  std::string tensor_name = name;
+  const auto split_pos = name.find('.');
+  if (split_pos != std::string::npos) {
+    module_name = name.substr(0, split_pos);
+    tensor_name = name.substr(split_pos + 1);
+  }
+  if (module_name.empty()) {
+    module_name = "misc";
+  }
+  if (tensor_name.empty()) {
+    tensor_name = "value";
+  }
+  const auto module_dir = layer_dir + "/" + sanitize_dump_name(module_name);
+  try {
+    std::filesystem::create_directories(module_dir);
+  } catch (const std::filesystem::filesystem_error& e) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to create " << module_dir << ": "
+                 << e.what();
+    return;
+  }
+  const auto path = module_dir + "/" + sanitize_dump_name(tensor_name) + ".pt";
   torch::Tensor out;
   try {
     out = dump_tensor_on_cpu(tensor);
@@ -720,7 +741,8 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   const auto dump_node_tensor = [&](const std::string& node,
                                     const torch::Tensor& tensor) {
     if (should_dump_layer0 && !rope_layer_dump_dir.empty()) {
-      dump_rope_tensor(rope_layer_dump_dir, node, tensor);
+      dump_rope_module_tensor(
+          rope_layer_dump_dir, "node_tensors", node, tensor);
     }
   };
   const auto dump_module_tensor = [&](const std::string& module_name,
@@ -964,15 +986,12 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
               << tensor_dtype_device_string(compress_cos)
               << " actual_seq_lengths_query="
               << tensor_shape_string(attn_metadata.actual_seq_lengths_query);
-    dump_rope_tensor(
-        rope_layer_dump_dir, "compressor.hidden_states.input", hidden_states);
-    dump_rope_tensor(
-        rope_layer_dump_dir, "compressor.compress_sin.input", compress_sin);
-    dump_rope_tensor(
-        rope_layer_dump_dir, "compressor.compress_cos.input", compress_cos);
-    dump_rope_tensor(rope_layer_dump_dir,
-                     "compressor.actual_seq_lengths_query.input",
-                     attn_metadata.actual_seq_lengths_query);
+    dump_module_tensor("compressor", "hidden_states.input", hidden_states);
+    dump_module_tensor("compressor", "compress_sin.input", compress_sin);
+    dump_module_tensor("compressor", "compress_cos.input", compress_cos);
+    dump_module_tensor("compressor",
+                       "actual_seq_lengths_query.input",
+                       attn_metadata.actual_seq_lengths_query);
 
     std::tuple<torch::Tensor, torch::Tensor> compressor_states{
         compressor_kv_state, compressor_score_state};
@@ -990,8 +1009,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     LOG(INFO) << "[DSV4][RoPE][CompressorOutput] layer=" << layer_id
               << " compressed_kv=" << tensor_shape_string(compressed_kv) << "/"
               << tensor_dtype_device_string(compressed_kv);
-    dump_rope_tensor(
-        rope_layer_dump_dir, "compressor.compressed_kv.output", compressed_kv);
+    dump_module_tensor("compressor", "compressed_kv.output", compressed_kv);
     scatter_by_slot(cmp_kv, cmp_slot, compressed_kv);
   }
 
@@ -1018,13 +1036,11 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
               << tensor_dtype_device_string(attn_metadata.c4_cos)
               << " c4_sin=" << tensor_shape_string(attn_metadata.c4_sin) << "/"
               << tensor_dtype_device_string(attn_metadata.c4_sin);
-    dump_rope_tensor(rope_layer_dump_dir, "indexer.qr.input", qr);
-    dump_rope_tensor(rope_layer_dump_dir, "indexer.cos.input", cos);
-    dump_rope_tensor(rope_layer_dump_dir, "indexer.sin.input", sin);
-    dump_rope_tensor(
-        rope_layer_dump_dir, "indexer.c4_cos.input", attn_metadata.c4_cos);
-    dump_rope_tensor(
-        rope_layer_dump_dir, "indexer.c4_sin.input", attn_metadata.c4_sin);
+    dump_module_tensor("indexer", "qr.input", qr);
+    dump_module_tensor("indexer", "cos.input", cos);
+    dump_module_tensor("indexer", "sin.input", sin);
+    dump_module_tensor("indexer", "c4_cos.input", attn_metadata.c4_cos);
+    dump_module_tensor("indexer", "c4_sin.input", attn_metadata.c4_sin);
     compress_topk_idxs =
         indexer_->select_qli(hidden_states,
                              qr,
@@ -1045,9 +1061,8 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
               << " compress_topk_idxs="
               << tensor_shape_string(compress_topk_idxs) << "/"
               << tensor_dtype_device_string(compress_topk_idxs);
-    dump_rope_tensor(rope_layer_dump_dir,
-                     "indexer.compress_topk_idxs.output",
-                     compress_topk_idxs);
+    dump_module_tensor(
+        "indexer", "compress_topk_idxs.output", compress_topk_idxs);
     CHECK(compress_topk_idxs.defined())
         << "DSAttention indexer returned undefined topk indices for "
            "compress_ratio==4.";

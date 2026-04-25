@@ -59,42 +59,18 @@ std::string tensor_debug_info(const torch::Tensor& tensor) {
   return os.str();
 }
 
-std::string normalize_quant_method(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-      });
-  return value;
-}
-
-std::optional<std::string> quant_method_from_global_config(
-    const QuantArgs& quant_args) {
-  auto quant_method = normalize_quant_method(quant_args.quant_method());
-  if (quant_method == "w8a8_dynamic") {
-    return quant_method;
-  }
-  auto quantize_type = normalize_quant_method(quant_args.quantize_type());
-  if (quantize_type == "w8a8_dynamic") {
-    return quantize_type;
-  }
-  return std::nullopt;
-}
-
 std::optional<std::string> resolve_moe_quant_method(
     const QuantArgs& quant_args,
     const StateDict& state_dict) {
   // resolve quant type by first expert.
   static const std::vector<std::vector<std::string>> kExpertPrefixGroups = {
       {"experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"},
-      {"experts.0.w1", "experts.0.w3", "experts.0.w2"},
-      {"experts.gate_up_proj", "experts.down_proj"},
-      {"gate_up_proj", "down_proj"}};
+      {"experts.0.w1", "experts.0.w3", "experts.0.w2"}};
   std::optional<std::string> first_quant;
   for (const auto& local_prefix_group : kExpertPrefixGroups) {
     if (auto quant = quant_args.get_quant_method_from_prefixes(
             state_dict, local_prefix_group);
         quant.has_value()) {
-      quant = normalize_quant_method(quant.value());
       if (!first_quant.has_value()) {
         first_quant = quant;
       } else {
@@ -103,17 +79,6 @@ std::optional<std::string> resolve_moe_quant_method(
             << first_quant.value() << " vs " << quant.value();
       }
     }
-  }
-  if (first_quant.has_value()) {
-    return first_quant;
-  }
-  if (auto global_quant = quant_method_from_global_config(quant_args);
-      global_quant.has_value()) {
-    LOG(WARNING) << "[QUANT_DEBUG][FusedMoELoad] quant method was not "
-                    "resolved from per-weight quant desc for prefix "
-                 << state_dict.prefix() << ", fallback to global "
-                 << global_quant.value();
-    return global_quant;
   }
   return first_quant;
 }
@@ -366,25 +331,17 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
             << ", ep_rank=" << ep_rank
             << ", num_experts_per_rank=" << num_experts_per_rank_
             << ", start_expert_id=" << start_expert_id_;
-  auto expert_weight_options = options_;
-  if (auto global_quant = quant_method_from_global_config(quant_args_);
-      is_w8a8_dynamic_quant_method(global_quant)) {
-    expert_weight_options = options_.dtype(torch::kInt8);
-  }
-  LOG(INFO) << "[MOE_LOAD_DEBUG][FusedMoEInit] expert_weight_dtype="
-            << c10::toString(
-                   c10::typeMetaToScalarType(expert_weight_options.dtype()));
   w13_ = register_parameter(
       "w13",
       torch::empty(
           {num_experts_per_rank_, local_intermediate_size * 2, hidden_size_},
-          expert_weight_options),
+          options_),
       false);
   w2_ = register_parameter(
       "w2",
       torch::empty(
           {num_experts_per_rank_, hidden_size_, local_intermediate_size},
-          expert_weight_options),
+          options_),
       false);
 }
 

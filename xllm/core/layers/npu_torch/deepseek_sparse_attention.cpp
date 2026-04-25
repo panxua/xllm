@@ -19,10 +19,12 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <tuple>
 #include <vector>
 
+#include "core/util/tensor_helper.h"
 #include "kernels/ops_api.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
@@ -30,6 +32,12 @@ DECLARE_bool(enable_chunked_prefill);
 namespace xllm {
 namespace layer {
 namespace {
+
+inline std::string attn_dump_path(int32_t layer_id, const std::string& name) {
+  static const std::string kDir = "/tmp/xllm_dump";
+  std::filesystem::create_directories(kDir);
+  return kDir + "/layer" + std::to_string(layer_id) + "_attn_" + name + ".pt";
+}
 
 struct DsaCacheMapping {
   int64_t cmp_cache_idx = -1;
@@ -450,13 +458,22 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                                           torch::Tensor>& compress_metadata) {
   (void)layer_name;
 
+  const int32_t lid = attn_metadata.layer_id;
+
+  save_tensor_distributed(hidden_states, attn_dump_path(lid, "hidden_states_input"));
+
   auto [c1_metadata, c4_metadata, c128_metadata, qli_metadata] =
       compress_metadata;
 
   // 1) q projection + q rmsnorm
   auto q_down = q_a_proj_->forward(hidden_states);
+  save_tensor_distributed(q_down, attn_dump_path(lid, "q_a_proj_output"));
+
   auto qr = std::get<0>(q_layernorm_->forward(q_down));
+  save_tensor_distributed(qr, attn_dump_path(lid, "q_layernorm_output"));
+
   auto q = q_b_proj_->forward(qr).view({-1, n_local_heads_, head_dim_});
+  save_tensor_distributed(q, attn_dump_path(lid, "q_b_proj_output"));
 
   xllm::kernel::FusedLayerNormParams q_rmsnorm_params;
   q_rmsnorm_params.input = q;
@@ -465,17 +482,23 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   q_rmsnorm_params.eps = eps_;
   xllm::kernel::fused_layernorm(q_rmsnorm_params);
   q = q_rmsnorm_params.output;
+  save_tensor_distributed(q, attn_dump_path(lid, "q_after_rmsnorm"));
 
   // 2) kv projection
   auto kv_down = kv_proj_->forward(hidden_states);
+  save_tensor_distributed(kv_down, attn_dump_path(lid, "kv_proj_output"));
+
   auto kv = std::get<0>(kv_layernorm_->forward(kv_down));
   kv = kv.view({-1, 1, qk_head_dim_});
+  save_tensor_distributed(kv, attn_dump_path(lid, "kv_after_layernorm"));
 
   // 3) RoPE (q and kv)
   auto cos = attn_metadata.cos;
   auto sin = attn_metadata.sin;
   apply_partial_rope(q, nope_head_dim_, rope_head_dim_, cos, sin);
   apply_partial_rope(kv, nope_head_dim_, rope_head_dim_, cos, sin);
+  save_tensor_distributed(q, attn_dump_path(lid, "q_after_rope"));
+  save_tensor_distributed(kv, attn_dump_path(lid, "kv_after_rope"));
 
   // 4) resolve per-layer cache mapping
   const int64_t compress_ratio_i = static_cast<int64_t>(compress_ratio_);
@@ -573,6 +596,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                              compress_sin,
                              compress_cos,
                              attn_metadata.actual_seq_lengths_query);
+    save_tensor_distributed(compressed_kv, attn_dump_path(lid, "compressed_kv"));
     scatter_by_slot(cmp_kv, cmp_slot, compressed_kv);
   }
 
@@ -609,6 +633,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     CHECK(compress_topk_idxs.defined())
         << "DSAttention indexer returned undefined topk indices for "
            "compress_ratio==4.";
+    save_tensor_distributed(compress_topk_idxs, attn_dump_path(lid, "indexer_topk_idxs"));
   }
 
   // 7) sparse shared-kv attention
@@ -654,16 +679,22 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       /*layout_kv=*/"PA_ND",
       /*return_softmax_lse=*/false);
 
+  save_tensor_distributed(attn_output, attn_dump_path(lid, "attn_output"));
+
   // 8) output RoPE + projection
   auto o = attn_output.view({-1, n_local_heads_, head_dim_});
   apply_partial_rope(
       o, nope_head_dim_, rope_head_dim_, cos, sin, /*inverse=*/true);
 
+  save_tensor_distributed(o, attn_dump_path(lid, "o_after_inverse_rope"));
+
   const int64_t num_tokens = o.size(0);
   auto o_group = o.view({num_tokens, n_local_groups_, -1});
   auto wo_a = o_a_proj_->weight().view({n_local_groups_, o_lora_rank_, -1});
   auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
+  save_tensor_distributed(o_low_rank, attn_dump_path(lid, "o_a_proj_output"));
   auto output = o_b_proj_->forward(o_low_rank.reshape({num_tokens, -1}));
+  save_tensor_distributed(output, attn_dump_path(lid, "o_b_proj_output"));
   std::optional<torch::Tensor> final_lse = std::nullopt;
   (void)output_lse;
 

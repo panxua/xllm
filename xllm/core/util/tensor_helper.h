@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <source_location>
@@ -28,6 +29,8 @@ limitations under the License.
 #include <vector>
 
 namespace xllm {
+
+namespace fs = std::filesystem;
 
 template <typename T>
 inline torch::Tensor create_2d_tensor(const std::vector<std::vector<T> >& vec,
@@ -77,13 +80,22 @@ inline torch::Tensor load_tensor(std::string filename) {
   return my_tensor;
 }
 
+inline void save_tensor_as_pickle(const torch::Tensor& tensor,
+                                  const std::string& file_path) {
+  std::vector<char> pickled = torch::pickle_save(tensor);
+  std::ofstream ofs(file_path, std::ios::binary);
+  CHECK(ofs.good()) << "Cannot open file: " << file_path;
+  ofs.write(pickled.data(), static_cast<std::streamsize>(pickled.size()));
+  CHECK(ofs.good()) << "Write failed to: " << file_path;
+}
+
 /**
  * @brief Save tensor with auto NPU device index in filename (like torch.save)
  * @param tensor Input tensor (CPU/NPU)
  * @param save_path Save file path
  * @demo save_tensor(tensor, "path/out.pt");
  */
-inline void save_tensor(const torch::Tensor& tensor, const std::string& save_path) {
+inline void save_tensor_distributed(const torch::Tensor& tensor, const std::string& save_path) {
     int device_index;
 
     // Get NPU device index: if CPU, create temp tensor on NPU
@@ -213,18 +225,6 @@ inline bool safe_concat(const std::vector<torch::Tensor>& vec,
   } else {
     return false;
   }
-}
-
-// save torch tensor to .pt file as pickle format, which is same as torch.save
-// in python. .pt file can be loaded by torch.load in python. file_path must end
-// with ".pt".
-inline void save_tensor_as_pickle(const torch::Tensor& tensor,
-                                  const std::string& file_path) {
-  std::vector<char> pickled = torch::pickle_save(tensor);
-  std::ofstream ofs(file_path, std::ios::binary);
-  CHECK(ofs.good()) << "Cannot open file: " << file_path;
-  ofs.write(pickled.data(), static_cast<std::streamsize>(pickled.size()));
-  CHECK(ofs.good()) << "Write failed to: " << file_path;
 }
 
 // Computes the new shape for tensor view casting between dtypes by bytes, for

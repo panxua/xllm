@@ -18,8 +18,18 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <filesystem>
 
+#include "core/util/tensor_helper.h"
 #include "kernels/ops_api.h"
+
+namespace {
+inline std::string layer_dump_path(int32_t layer_id, const std::string& name) {
+  static const std::string kDir = "/tmp/xllm_dump";
+  std::filesystem::create_directories(kDir);
+  return kDir + "/layer" + std::to_string(layer_id) + "_" + name + ".pt";
+}
+}  // namespace
 
 namespace xllm {
 namespace layer {
@@ -197,12 +207,18 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   CHECK(attn_metadata.dsa_metadata)
       << "DeepseekV4DecoderLayer requires DSA metadata for DSAttention path.";
 
+  auto& dsa = *(attn_metadata.dsa_metadata);
+  const int32_t layer_id = dsa.layer_id;
+
+  save_tensor_distributed(x, layer_dump_path(layer_id, "layer_input"));
+
   auto residual_attn = x;
   auto [attn_input, post_attn, comb_attn] =
       hc_pre(x, hc_attn_fn_, hc_attn_scale_, hc_attn_base_);
   attn_input = std::get<0>(attn_norm_->forward(attn_input));
 
-  auto& dsa = *(attn_metadata.dsa_metadata);
+  save_tensor_distributed(attn_input, layer_dump_path(layer_id, "attn_input"));
+
   const auto compress_metadata = std::make_tuple(
       dsa.c1_metadata, dsa.c4_metadata, dsa.c128_metadata, dsa.qli_metadata);
   KVState kv_state{kv_cache.get_swa_cache(),
@@ -216,16 +232,23 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
       kv_cache,
       kv_state,
       attn_metadata.is_prefill || attn_metadata.is_chunked_prefill,
-      std::to_string(dsa.layer_id),
+      std::to_string(layer_id),
       compress_metadata);
   (void)attn_lse;
+
+  save_tensor_distributed(attn_output, layer_dump_path(layer_id, "attn_output"));
+
   attn_input = attn_output;
   x = hc_post(attn_input, residual_attn, post_attn, comb_attn);
+
+  save_tensor_distributed(x, layer_dump_path(layer_id, "attn_block_output"));
 
   auto residual_ffn = x;
   auto [ffn_input, post_ffn, comb_ffn] =
       hc_pre(x, hc_ffn_fn_, hc_ffn_scale_, hc_ffn_base_);
   ffn_input = std::get<0>(ffn_norm_->forward(ffn_input));
+
+  save_tensor_distributed(ffn_input, layer_dump_path(layer_id, "moe_input"));
 
   auto ffn_input_2d = ffn_input.reshape({-1, ffn_input.size(-1)});
   std::optional<torch::Tensor> gate_input_ids = std::nullopt;
@@ -248,9 +271,18 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
         << "DeepseekV4 hash gate requires input_ids for routing";
   }
   auto [topk_weights, topk_ids] = gate_->forward(ffn_input_2d, gate_input_ids);
+
+  save_tensor_distributed(topk_weights, layer_dump_path(layer_id, "gate_topk_weights"));
+  save_tensor_distributed(topk_ids, layer_dump_path(layer_id, "gate_topk_ids"));
+
   ffn_input = moe_mlp_->forward_with_selected_experts(
       ffn_input, topk_weights, topk_ids, input_params);
+
+  save_tensor_distributed(ffn_input, layer_dump_path(layer_id, "moe_output"));
+
   x = hc_post(ffn_input, residual_ffn, post_ffn, comb_ffn);
+
+  save_tensor_distributed(x, layer_dump_path(layer_id, "layer_output"));
 
   return x;
 }

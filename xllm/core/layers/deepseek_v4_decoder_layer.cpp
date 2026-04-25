@@ -18,8 +18,15 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <exception>
+#include <filesystem>
+#include <sstream>
+#include <string>
 
 #include "kernels/ops_api.h"
+#include "xllm/core/util/tensor_helper.h"
 
 namespace xllm {
 namespace layer {
@@ -44,6 +51,117 @@ int64_t module_registered_tensor_bytes(const torch::nn::Module& module) {
   return total_bytes;
 }
 
+std::string tensor_shape_string(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+  std::ostringstream os;
+  os << "[";
+  for (int64_t i = 0; i < tensor.dim(); ++i) {
+    if (i > 0) {
+      os << ",";
+    }
+    os << tensor.size(i);
+  }
+  os << "]";
+  return os.str();
+}
+
+std::string tensor_dtype_device_string(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+  std::ostringstream os;
+  os << tensor.scalar_type() << "," << tensor.device();
+  return os.str();
+}
+
+std::string sanitize_dump_name(std::string name) {
+  for (auto& ch : name) {
+    if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' ||
+          ch == '-' || ch == '.')) {
+      ch = '_';
+    }
+  }
+  return name;
+}
+
+std::string deepseek_v4_dump_root() {
+  const char* disabled = std::getenv("XLLM_DSV4_ROPE_DUMP_DISABLE");
+  if (disabled != nullptr && std::string(disabled) == "1") {
+    return "";
+  }
+  const char* root = std::getenv("XLLM_DSV4_ROPE_DUMP_DIR");
+  if (root != nullptr && root[0] != '\0') {
+    return root;
+  }
+  return "./xllm_deepseek_v4_rope_dump";
+}
+
+int32_t deepseek_v4_dump_layer_id() {
+  const char* env_layer_id = std::getenv("XLLM_DSV4_DUMP_LAYER_ID");
+  if (env_layer_id == nullptr || env_layer_id[0] == '\0') {
+    return 0;
+  }
+  try {
+    return std::stoi(env_layer_id);
+  } catch (const std::exception&) {
+    LOG(WARNING) << "[DSV4][Dump] invalid XLLM_DSV4_DUMP_LAYER_ID="
+                 << env_layer_id << ", fallback to 0";
+    return 0;
+  }
+}
+
+std::string make_layer_dump_dir(int64_t tp_rank, int32_t layer_id) {
+  const auto root = deepseek_v4_dump_root();
+  if (root.empty()) {
+    return "";
+  }
+  const auto dir = root + "/tp_" + std::to_string(tp_rank) + "/layer_" +
+                   std::to_string(layer_id);
+  try {
+    std::filesystem::create_directories(dir);
+  } catch (const std::filesystem::filesystem_error& e) {
+    LOG(WARNING) << "[DSV4][Dump] failed to create " << dir << ": " << e.what();
+    return "";
+  }
+  return dir;
+}
+
+torch::Tensor dump_tensor_on_cpu(const torch::Tensor& tensor) {
+  if (!tensor.defined() || tensor.numel() == 0) {
+    return torch::Tensor();
+  }
+  return tensor.contiguous().to(torch::kCPU);
+}
+
+void dump_module_tensor(const std::string& layer_dump_dir,
+                        const std::string& module_file,
+                        const std::string& module_name,
+                        const std::string& tensor_name,
+                        const torch::Tensor& tensor) {
+  if (layer_dump_dir.empty() || !tensor.defined()) {
+    return;
+  }
+  const auto module_dir = layer_dump_dir + "/" +
+                          sanitize_dump_name(module_file) + "/" +
+                          sanitize_dump_name(module_name);
+  try {
+    std::filesystem::create_directories(module_dir);
+  } catch (const std::filesystem::filesystem_error& e) {
+    LOG(WARNING) << "[DSV4][Dump] failed to create " << module_dir << ": "
+                 << e.what();
+    return;
+  }
+  const auto path = module_dir + "/" + sanitize_dump_name(tensor_name) + ".pt";
+  try {
+    save_tensor_as_pickle(dump_tensor_on_cpu(tensor), path);
+  } catch (const c10::Error& e) {
+    LOG(WARNING) << "[DSV4][Dump] failed to save " << path << ": "
+                 << e.what_without_backtrace();
+  }
+}
+
 }  // namespace
 
 DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
@@ -53,6 +171,8 @@ DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
   const auto& quant_args = context.get_quant_args();
   const auto& parallel_args = context.get_parallel_args();
   const auto& options = context.get_tensor_options();
+  layer_id_ = layer_id;
+  tp_rank_ = parallel_args.tp_group_->rank();
 
   int64_t hidden_size = args.hidden_size();
 
@@ -194,6 +314,26 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
 
   residual = std::nullopt;
 
+  const int32_t dump_layer_id = deepseek_v4_dump_layer_id();
+  const bool should_dump_target_layer = (layer_id_ == dump_layer_id);
+  const auto layer_dump_dir = should_dump_target_layer
+                                  ? make_layer_dump_dir(tp_rank_, dump_layer_id)
+                                  : "";
+  const auto log_moe_tensor = [&](const std::string& node,
+                                  const torch::Tensor& tensor) {
+    LOG(INFO) << "[DSV4][Node] file=deepseek_v4_decoder_layer.cpp layer="
+              << layer_id_ << " module=moe tensor=" << node
+              << " shape=" << tensor_shape_string(tensor)
+              << " dtype_device=" << tensor_dtype_device_string(tensor);
+  };
+  const auto dump_moe_tensor = [&](const std::string& node,
+                                   const torch::Tensor& tensor) {
+    if (should_dump_target_layer) {
+      dump_module_tensor(
+          layer_dump_dir, "deepseek_v4_decoder_layer.cpp", "moe", node, tensor);
+    }
+  };
+
   CHECK(attn_metadata.dsa_metadata)
       << "DeepseekV4DecoderLayer requires DSA metadata for DSAttention path.";
 
@@ -228,6 +368,8 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   ffn_input = std::get<0>(ffn_norm_->forward(ffn_input));
 
   auto ffn_input_2d = ffn_input.reshape({-1, ffn_input.size(-1)});
+  log_moe_tensor("ffn_input_2d.input", ffn_input_2d);
+  dump_moe_tensor("ffn_input_2d.input", ffn_input_2d);
   std::optional<torch::Tensor> gate_input_ids = std::nullopt;
   if (input_ids.has_value() && input_ids.value().defined()) {
     auto flat_input_ids =
@@ -243,13 +385,25 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
                            .reshape({hidden_rows});
     }
   }
+  if (gate_input_ids.has_value()) {
+    log_moe_tensor("gate_input_ids.input", gate_input_ids.value());
+    dump_moe_tensor("gate_input_ids.input", gate_input_ids.value());
+  } else {
+    log_moe_tensor("gate_input_ids.input", torch::Tensor());
+  }
   if (gate_->is_hash_layer()) {
     CHECK(gate_input_ids.has_value())
         << "DeepseekV4 hash gate requires input_ids for routing";
   }
   auto [topk_weights, topk_ids] = gate_->forward(ffn_input_2d, gate_input_ids);
+  log_moe_tensor("topk_weights.output", topk_weights);
+  log_moe_tensor("topk_ids.output", topk_ids);
+  dump_moe_tensor("topk_weights.output", topk_weights);
+  dump_moe_tensor("topk_ids.output", topk_ids);
   ffn_input = moe_mlp_->forward_with_selected_experts(
       ffn_input, topk_weights, topk_ids, input_params);
+  log_moe_tensor("moe_output.output", ffn_input);
+  dump_moe_tensor("moe_output.output", ffn_input);
   x = hc_post(ffn_input, residual_ffn, post_ffn, comb_ffn);
 
   return x;

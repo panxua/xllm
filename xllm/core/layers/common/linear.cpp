@@ -1507,9 +1507,8 @@ torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input,
     output = xllm::kernel::matmul(matmul_params);
   }
 
-  bool expected = false;
-  if (is_dump &&
-      first_forward_dump_done_.compare_exchange_strong(expected, true)) {
+  if (is_dump && !first_forward_dump_done_) {
+    first_forward_dump_done_ = true;
     const char* env_dump_dir = std::getenv("XLLM_REPLICATED_LINEAR_DUMP_DIR");
     const std::string base_dir = (env_dump_dir != nullptr && *env_dump_dir)
                                      ? std::string(env_dump_dir)

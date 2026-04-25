@@ -1475,7 +1475,9 @@ torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input,
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
   torch::Tensor output;
   LOG(INFO) << "======================resolved_weight_quant_method_ : "
-            << resolved_weight_quant_method_;
+            << (resolved_weight_quant_method_.has_value()
+                    ? resolved_weight_quant_method_.value()
+                    : "none");
   if (is_w8a8_quant(resolved_weight_quant_method_)) {
     CHECK(input_scale_is_loaded_ && input_scale_.defined())
         << "input_scale is required for w8a8 quant matmul.";

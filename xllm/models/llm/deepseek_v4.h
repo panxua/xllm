@@ -408,6 +408,7 @@ class DeepseekV4ModelImpl
                       torch::Tensor positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) override {
+    torch::NoGradGuard no_grad;
     const bool should_dump_layer0 = !layers_.empty();
     const auto layer0_dump_dir =
         should_dump_layer0 ? deepseek_v4_make_layer0_dump_dir(tp_rank_) : "";

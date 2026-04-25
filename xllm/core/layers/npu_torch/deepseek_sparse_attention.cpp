@@ -768,7 +768,8 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   dump_node_tensor("q_rmsnorm.output", q);
 
   // 2) kv projection
-  auto kv_down = kv_proj_->forward(hidden_states);
+  auto kv_down =
+      kv_proj_->forward(hidden_states, /*is_dump=*/true, /*tp_rank=*/tp_rank_);
   log_node_tensor("kv_proj.output", kv_down);
   dump_node_tensor("kv_proj.output", kv_down);
   auto kv = std::get<0>(kv_layernorm_->forward(kv_down));

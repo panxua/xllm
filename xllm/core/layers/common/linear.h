@@ -18,6 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <atomic>
+
 #include "core/framework/model_context.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
@@ -317,7 +319,9 @@ class ReplicatedLinearImpl : public torch::nn::Module {
       const torch::TensorOptions& options,
       const LinearExtraArgs& linear_extra_args = LinearExtraArgs());
 
-  torch::Tensor forward(torch::Tensor input);
+  torch::Tensor forward(torch::Tensor input,
+                        bool is_dump = false,
+                        int64_t tp_rank = -1);
 
   // load the weight from the checkpoint
   void load_state_dict(const StateDict& state_dict);
@@ -342,6 +346,7 @@ class ReplicatedLinearImpl : public torch::nn::Module {
   DEFINE_WEIGHT(deq_scale);      // Static W8A8 descale tensor.
   DEFINE_WEIGHT(quant_bias);     // Static W8A8 quant_matmul bias.
   DEFINE_WEIGHT(weight_offset);  // Dynamic W8A8 checkpoint parity placeholder.
+  std::atomic<bool> first_forward_dump_done_{false};
   QuantArgs quant_args_;
   torch::TensorOptions options_;
   std::optional<std::string> resolved_weight_quant_method_;

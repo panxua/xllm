@@ -17,9 +17,13 @@ limitations under the License.
 
 #include <glog/logging.h>
 #include <torch/torch.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <sstream>
 
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
@@ -221,6 +225,19 @@ bool is_w8a8_quant(
     const std::optional<std::string>& resolved_weight_quant_method) {
   return resolved_weight_quant_method.has_value() &&
          resolved_weight_quant_method.value() == "w8a8";
+}
+
+std::string sanitize_dump_name(std::string name) {
+  if (name.empty()) {
+    return "unnamed";
+  }
+  for (auto& c : name) {
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' ||
+          c == '.')) {
+      c = '_';
+    }
+  }
+  return name;
 }
 
 torch::Dtype get_w8a8_deq_scale_dtype(const torch::TensorOptions& options) {
@@ -1450,9 +1467,12 @@ ReplicatedLinearImpl::ReplicatedLinearImpl(
   }
 }
 
-torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input) {
+torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input,
+                                            bool is_dump,
+                                            int64_t tp_rank) {
   auto bias =
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+  torch::Tensor output;
   if (is_w8a8_quant(resolved_weight_quant_method_)) {
     CHECK(input_scale_is_loaded_ && input_scale_.defined())
         << "input_scale is required for w8a8 quant matmul.";
@@ -1463,29 +1483,108 @@ torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input) {
     auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
                           ? std::optional<torch::Tensor>(quant_bias_)
                           : std::nullopt;
-    return npu_w8a8_linear_forward(input,
-                                   weight_,
-                                   input_scale_,
-                                   input_offset_,
-                                   deq_scale_,
-                                   quant_bias,
-                                   input.scalar_type());
-  }
-  if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    output = npu_w8a8_linear_forward(input,
+                                     weight_,
+                                     input_scale_,
+                                     input_offset_,
+                                     deq_scale_,
+                                     quant_bias,
+                                     input.scalar_type());
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     auto weight_scale = weight_scale_is_loaded_
                             ? std::optional<torch::Tensor>(weight_scale_)
                             : std::nullopt;
     CHECK(weight_scale.has_value() && weight_scale.value().defined())
         << "weight_scale is required for w8a8_dynamic quant matmul.";
-    return npu_w8a8_dynamic_linear_forward(
+    output = npu_w8a8_dynamic_linear_forward(
         input, weight_, weight_scale.value(), bias, input.scalar_type());
-  }
-  xllm::kernel::MatmulParams matmul_params;
-  matmul_params.a = input;
-  matmul_params.b = weight_;
-  matmul_params.bias = bias;
+  } else {
+    xllm::kernel::MatmulParams matmul_params;
+    matmul_params.a = input;
+    matmul_params.b = weight_;
+    matmul_params.bias = bias;
 
-  auto output = xllm::kernel::matmul(matmul_params);
+    output = xllm::kernel::matmul(matmul_params);
+  }
+
+  bool expected = false;
+  if (is_dump &&
+      first_forward_dump_done_.compare_exchange_strong(expected, true)) {
+    const char* env_dump_dir = std::getenv("XLLM_REPLICATED_LINEAR_DUMP_DIR");
+    const std::string base_dir = (env_dump_dir != nullptr && *env_dump_dir)
+                                     ? std::string(env_dump_dir)
+                                     : "/tmp/xllm_replicated_linear_dump";
+    const std::string module_name = sanitize_dump_name(name());
+
+    std::ostringstream rank_dir;
+    rank_dir << base_dir << "/tp_rank_" << tp_rank;
+    const std::string tp_rank_dir = rank_dir.str();
+
+    std::ostringstream oss;
+    oss << tp_rank_dir << "/" << module_name << "_pid" << ::getpid() << "_"
+        << reinterpret_cast<uintptr_t>(this);
+    const std::string dump_dir = oss.str();
+
+    auto dump_tensor = [&](const std::string& dump_name,
+                           const torch::Tensor& tensor) {
+      if (!tensor.defined()) {
+        return;
+      }
+      try {
+        auto dump_tensor = tensor.detach();
+        if (dump_tensor.device().type() != torch::kCPU) {
+          dump_tensor = dump_tensor.to(torch::kCPU);
+        }
+        dump_tensor = dump_tensor.contiguous();
+        const std::string path =
+            dump_dir + "/" + sanitize_dump_name(dump_name) + ".pt";
+        torch::save(dump_tensor, path);
+      } catch (const c10::Error& e) {
+        LOG(WARNING) << "[ReplicatedLinearDump] failed to save tensor "
+                     << dump_name << " in " << dump_dir << ": " << e.what();
+      }
+    };
+
+    try {
+      std::filesystem::create_directories(dump_dir);
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "[ReplicatedLinearDump] failed to create dump dir "
+                   << dump_dir << ": " << e.what();
+      return output;
+    }
+
+    LOG(INFO) << "[ReplicatedLinearDump] first forward dump enabled. module="
+              << module_name << " dump_dir=" << dump_dir << " quant_method="
+              << (resolved_weight_quant_method_.has_value()
+                      ? resolved_weight_quant_method_.value()
+                      : "none");
+
+    dump_tensor("input", input);
+    dump_tensor("output", output);
+    dump_tensor("weight", weight_);
+    if (bias_.defined()) {
+      dump_tensor("bias", bias_);
+    }
+    if (input_scale_.defined()) {
+      dump_tensor("input_scale", input_scale_);
+    }
+    if (input_offset_.defined()) {
+      dump_tensor("input_offset", input_offset_);
+    }
+    if (deq_scale_.defined()) {
+      dump_tensor("deq_scale", deq_scale_);
+    }
+    if (quant_bias_.defined()) {
+      dump_tensor("quant_bias", quant_bias_);
+    }
+    if (weight_scale_.defined()) {
+      dump_tensor("weight_scale", weight_scale_);
+    }
+    if (weight_offset_.defined()) {
+      dump_tensor("weight_offset", weight_offset_);
+    }
+  }
+
   return output;
 }
 

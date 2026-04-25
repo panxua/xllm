@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
+#include <cstdint>
 #include <utility>
 
 #include "layers/common/rotary_embedding_util.h"
@@ -71,8 +72,13 @@ DeepseekV4RotaryEmbedding::DeepseekV4RotaryEmbedding(
   CHECK_GT(max_position_embeddings_, 0)
       << "max_position_embeddings must be > 0";
 
+  const int64_t max_idx_default = max_position_embeddings_;
+  const int64_t max_idx_c4 = (max_position_embeddings_ - 1) / 4 + 1;
+  const int64_t max_idx_c128 = (max_position_embeddings_ - 1) / 128 + 1;
+
   cos_sin_cache_by_group_[kDefaultGroup] =
-      create_cos_sin_cache(rope_theta,
+      create_cos_sin_cache(max_idx_default,
+                           rope_theta,
                            scaling_factor,
                            extrapolation_factor,
                            beta_fast,
@@ -83,7 +89,8 @@ DeepseekV4RotaryEmbedding::DeepseekV4RotaryEmbedding(
                            original_max_position_embeddings);
 
   cos_sin_cache_by_group_[kC4Group] =
-      create_cos_sin_cache(compress_rope_theta,
+      create_cos_sin_cache(max_idx_c4,
+                           compress_rope_theta,
                            scaling_factor,
                            extrapolation_factor,
                            beta_fast,
@@ -93,7 +100,8 @@ DeepseekV4RotaryEmbedding::DeepseekV4RotaryEmbedding(
                            mscale_all_dim,
                            original_max_position_embeddings);
   cos_sin_cache_by_group_[kC128Group] =
-      create_cos_sin_cache(compress_rope_theta,
+      create_cos_sin_cache(max_idx_c128,
+                           compress_rope_theta,
                            scaling_factor,
                            extrapolation_factor,
                            beta_fast,
@@ -195,6 +203,7 @@ std::vector<std::string> DeepseekV4RotaryEmbedding::registered_groups() const {
 }
 
 torch::Tensor DeepseekV4RotaryEmbedding::create_cos_sin_cache(
+    int64_t max_position_embeddings,
     float theta,
     float scaling_factor,
     float extrapolation_factor,
@@ -204,24 +213,35 @@ torch::Tensor DeepseekV4RotaryEmbedding::create_cos_sin_cache(
     float mscale,
     float mscale_all_dim,
     int64_t original_max_position_embeddings) const {
-  auto inv_freq = rotary::apply_deepseek_yarn_rope_scaling(
-      scaling_factor,
-      extrapolation_factor,
-      beta_fast,
-      beta_slow,
-      rotary_dim_,
-      theta,
-      original_max_position_embeddings);
+  (void)extrapolation_factor;
+  (void)attn_factor;
+  (void)mscale;
+  (void)mscale_all_dim;
+  CHECK(interleaved_) << "DeepSeek V4 RoPE must use interleaved cos/sin layout";
 
-  return rotary::compute_cos_sin_cache(rotary_dim_,
-                                       max_position_embeddings_,
-                                       interleaved_,
-                                       scaling_factor,
-                                       attn_factor,
-                                       mscale,
-                                       mscale_all_dim,
-                                       inv_freq,
-                                       options_);
+  auto cpu_options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+  auto slice = torch::arange(0, rotary_dim_, 2, cpu_options);
+  auto freqs =
+      1.0 / torch::pow(theta, slice / static_cast<double>(rotary_dim_));
+
+  if (original_max_position_embeddings > 0) {
+    auto inv_freq = rotary::apply_deepseek_yarn_rope_scaling(
+        scaling_factor,
+        1,
+        beta_fast,
+        beta_slow,
+        rotary_dim_,
+        theta,
+        original_max_position_embeddings);
+    freqs = inv_freq.to(torch::kCPU).to(torch::kFloat32);
+  }
+
+  auto positions = torch::arange(max_position_embeddings, cpu_options);
+  auto phase = torch::outer(positions, freqs);
+  auto emb = phase.repeat_interleave(/*repeats=*/2, /*dim=*/-1);
+  auto cos_sin = torch::cat({emb.cos(), emb.sin()}, /*dim=*/-1);
+  return cos_sin.to(options_);
 }
 
 }  // namespace layer

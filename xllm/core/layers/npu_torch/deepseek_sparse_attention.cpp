@@ -17,14 +17,22 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <numeric>
+#include <sstream>
+#include <string>
 #include <tuple>
 #include <vector>
 
 #include "kernels/ops_api.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
+#include "xllm/core/util/tensor_helper.h"
 
 DECLARE_bool(enable_chunked_prefill);
 namespace xllm {
@@ -120,12 +128,233 @@ DsaCacheMapping resolve_cache_mapping(const DSAMetadata& attn_metadata,
   return mapping;
 }
 
+std::string tensor_shape_string(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+  std::ostringstream os;
+  os << "[";
+  for (int64_t i = 0; i < tensor.dim(); ++i) {
+    if (i > 0) {
+      os << ",";
+    }
+    os << tensor.size(i);
+  }
+  os << "]";
+  return os.str();
+}
+
+std::string tensor_dtype_device_string(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+  std::ostringstream os;
+  os << tensor.scalar_type() << "," << tensor.device();
+  return os.str();
+}
+
+std::string sanitize_dump_name(std::string name) {
+  for (auto& ch : name) {
+    if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' ||
+          ch == '-' || ch == '.')) {
+      ch = '_';
+    }
+  }
+  return name;
+}
+
+std::string rope_dump_root() {
+  const char* disabled = std::getenv("XLLM_DSV4_ROPE_DUMP_DISABLE");
+  if (disabled != nullptr && std::string(disabled) == "1") {
+    return "";
+  }
+  const char* root = std::getenv("XLLM_DSV4_ROPE_DUMP_DIR");
+  if (root != nullptr && root[0] != '\0') {
+    return root;
+  }
+  return "./xllm_deepseek_v4_rope_dump";
+}
+
+torch::Tensor dump_tensor_on_cpu(const torch::Tensor& tensor) {
+  if (!tensor.defined() || tensor.numel() == 0) {
+    return torch::Tensor();
+  }
+  return tensor.contiguous().to(torch::kCPU);
+}
+
+void dump_rope_tensor(const std::string& layer_dir,
+                      const std::string& name,
+                      const torch::Tensor& tensor) {
+  if (layer_dir.empty() || !tensor.defined()) {
+    return;
+  }
+  const auto path = layer_dir + "/" + sanitize_dump_name(name) + ".pt";
+  torch::Tensor out;
+  try {
+    out = dump_tensor_on_cpu(tensor);
+  } catch (const c10::Error& e) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to prepare " << path << ": "
+                 << e.what_without_backtrace();
+    return;
+  }
+  try {
+    save_tensor_as_pickle(out, path);
+  } catch (const c10::Error& e) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to save " << path << ": "
+                 << e.what_without_backtrace();
+  }
+}
+
+void dump_rope_module_tensor(const std::string& layer_dir,
+                             const std::string& module_name,
+                             const std::string& tensor_name,
+                             const torch::Tensor& tensor) {
+  if (layer_dir.empty() || module_name.empty() || !tensor.defined()) {
+    return;
+  }
+  const auto module_dir = layer_dir + "/" + sanitize_dump_name(module_name);
+  try {
+    std::filesystem::create_directories(module_dir);
+  } catch (const std::filesystem::filesystem_error& e) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to create " << module_dir << ": "
+                 << e.what();
+    return;
+  }
+  const auto path = module_dir + "/" + sanitize_dump_name(tensor_name) + ".pt";
+  torch::Tensor out;
+  try {
+    out = dump_tensor_on_cpu(tensor);
+  } catch (const c10::Error& e) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to prepare " << path << ": "
+                 << e.what_without_backtrace();
+    return;
+  }
+  try {
+    save_tensor_as_pickle(out, path);
+  } catch (const c10::Error& e) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to save " << path << ": "
+                 << e.what_without_backtrace();
+  }
+}
+
+void dump_rope_module_text(const std::string& layer_dir,
+                           const std::string& module_name,
+                           const std::string& name,
+                           const std::string& text) {
+  if (layer_dir.empty() || module_name.empty()) {
+    return;
+  }
+  const auto module_dir = layer_dir + "/" + sanitize_dump_name(module_name);
+  try {
+    std::filesystem::create_directories(module_dir);
+  } catch (const std::filesystem::filesystem_error& e) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to create " << module_dir << ": "
+                 << e.what();
+    return;
+  }
+  const auto path = module_dir + "/" + sanitize_dump_name(name) + ".txt";
+  std::ofstream ofs(path, std::ios::out | std::ios::trunc);
+  if (!ofs) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to open " << path;
+    return;
+  }
+  ofs << text;
+}
+
+void dump_rope_text(const std::string& layer_dir,
+                    const std::string& name,
+                    const std::string& text) {
+  if (layer_dir.empty()) {
+    return;
+  }
+  const auto path = layer_dir + "/" + sanitize_dump_name(name) + ".txt";
+  std::ofstream ofs(path, std::ios::out | std::ios::trunc);
+  if (!ofs) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to open " << path;
+    return;
+  }
+  ofs << text;
+}
+
+std::string make_rope_layer_dump_dir(int64_t tp_rank, int32_t layer_id) {
+  auto root = rope_dump_root();
+  if (root.empty()) {
+    return "";
+  }
+  const auto tp_rank_name = "tp_rank_" + std::to_string(tp_rank);
+  const auto layer_name = "layer_" + std::to_string(layer_id);
+  const auto layer_dir = root + "/" + tp_rank_name + "/" + layer_name;
+  try {
+    std::filesystem::create_directories(layer_dir);
+  } catch (const std::filesystem::filesystem_error& e) {
+    LOG(WARNING) << "[DSV4][RoPE Dump] failed to create " << layer_dir << ": "
+                 << e.what();
+    return "";
+  }
+  return layer_dir;
+}
+
+void dump_rope_call(const std::string& layer_dir,
+                    const std::string& stage,
+                    int32_t layer_id,
+                    int64_t rope_start_dim,
+                    int64_t rope_head_dim,
+                    bool inverse,
+                    const torch::Tensor& input_before,
+                    const torch::Tensor& cos,
+                    const torch::Tensor& sin,
+                    const torch::Tensor& input_after) {
+  LOG(INFO) << "[DSV4][RoPE] layer=" << layer_id << " stage=" << stage
+            << " inverse=" << inverse << " rope_start_dim=" << rope_start_dim
+            << " rope_head_dim=" << rope_head_dim
+            << " input=" << tensor_shape_string(input_before) << "/"
+            << tensor_dtype_device_string(input_before)
+            << " cos=" << tensor_shape_string(cos) << "/"
+            << tensor_dtype_device_string(cos)
+            << " sin=" << tensor_shape_string(sin) << "/"
+            << tensor_dtype_device_string(sin)
+            << " output=" << tensor_shape_string(input_after) << "/"
+            << tensor_dtype_device_string(input_after);
+
+  if (layer_dir.empty()) {
+    return;
+  }
+  const auto safe_stage = sanitize_dump_name(stage);
+  const auto rope_module_name = "rope_" + safe_stage;
+  std::ostringstream meta;
+  meta << "layer=" << layer_id << "\n"
+       << "stage=" << stage << "\n"
+       << "inverse=" << inverse << "\n"
+       << "rope_start_dim=" << rope_start_dim << "\n"
+       << "rope_head_dim=" << rope_head_dim << "\n"
+       << "input_shape=" << tensor_shape_string(input_before) << "\n"
+       << "input_dtype_device=" << tensor_dtype_device_string(input_before)
+       << "\n"
+       << "cos_shape=" << tensor_shape_string(cos) << "\n"
+       << "cos_dtype_device=" << tensor_dtype_device_string(cos) << "\n"
+       << "sin_shape=" << tensor_shape_string(sin) << "\n"
+       << "sin_dtype_device=" << tensor_dtype_device_string(sin) << "\n"
+       << "output_shape=" << tensor_shape_string(input_after) << "\n"
+       << "output_dtype_device=" << tensor_dtype_device_string(input_after)
+       << "\n";
+  dump_rope_module_text(layer_dir, rope_module_name, "meta", meta.str());
+  dump_rope_module_tensor(
+      layer_dir, rope_module_name, "input_before", input_before);
+  dump_rope_module_tensor(layer_dir, rope_module_name, "cos", cos);
+  dump_rope_module_tensor(layer_dir, rope_module_name, "sin", sin);
+  dump_rope_module_tensor(
+      layer_dir, rope_module_name, "input_after", input_after);
+}
+
 void apply_partial_rope(torch::Tensor& input,
                         int64_t rope_start_dim,
                         int64_t rope_head_dim,
                         const torch::Tensor& cos,
                         const torch::Tensor& sin,
-                        bool inverse = false) {
+                        bool inverse = false,
+                        int32_t layer_id = -1,
+                        const std::string& stage = "rope",
+                        const std::string& layer_dump_dir = "") {
   if (!input.defined() || !cos.defined() || !sin.defined() ||
       rope_head_dim <= 0 || rope_start_dim < 0) {
     return;
@@ -154,6 +383,7 @@ void apply_partial_rope(torch::Tensor& input,
       << rope_head_dim << "), got cos " << cos_cache.size(1) << ", sin "
       << sin_cache.size(1);
 
+  auto input_before = input.detach().clone();
   auto cos_4d = cos_cache.view({cos_cache.size(0), 1, 1, rope_head_dim});
   auto sin_4d = sin_cache.view({sin_cache.size(0), 1, 1, rope_head_dim});
   auto input_4d =
@@ -167,6 +397,16 @@ void apply_partial_rope(torch::Tensor& input,
   xllm::kernel::npu_inplace_partial_rotary_mul(rope_params);
   input =
       (input.dim() == 3) ? input_4d.squeeze(2) : input_4d.squeeze(1).squeeze(1);
+  dump_rope_call(layer_dump_dir,
+                 stage,
+                 layer_id,
+                 rope_start_dim,
+                 rope_head_dim,
+                 inverse,
+                 input_before,
+                 cos,
+                 sin_cache,
+                 input);
 }
 
 void scatter_by_slot(torch::Tensor& cache,
@@ -327,6 +567,16 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
   nope_head_dim_ = head_dim_ - rope_head_dim_;
   qk_head_dim_ = nope_head_dim_ + rope_head_dim_;
 
+  LOG(INFO) << "[DSV4][HeadDim][AttentionInit] layer=" << layer_id
+            << " attention_head_dim(args.head_dim)=" << head_dim_
+            << " head_size=" << head_size_
+            << " rope_head_dim=" << rope_head_dim_
+            << " nope_head_dim=" << nope_head_dim_
+            << " qk_head_dim=" << qk_head_dim_
+            << " q_lora_rank=" << q_lora_rank_
+            << " o_lora_rank=" << o_lora_rank_
+            << " compress_ratio=" << compress_ratio_;
+
   const int64_t tp_size = parallel_args.tp_group_->world_size();
   tp_rank_ = parallel_args.tp_group_->rank();
   tp_size_ = tp_size;
@@ -452,11 +702,60 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
 
   auto [c1_metadata, c4_metadata, c128_metadata, qli_metadata] =
       compress_metadata;
+  const int32_t layer_id = attn_metadata.layer_id;
+  const bool should_dump_layer0 = (layer_id == 0);
+  const auto rope_layer_dump_dir =
+      should_dump_layer0 ? make_rope_layer_dump_dir(tp_rank_, layer_id) : "";
+  LOG(INFO) << "[DSV4][RoPE Dump] tp_rank=" << tp_rank_
+            << " tp_size=" << tp_size_ << " layer=" << layer_id
+            << " enabled=" << should_dump_layer0
+            << " dump_dir=" << rope_layer_dump_dir;
+
+  const auto log_node_tensor = [&](const std::string& node,
+                                   const torch::Tensor& tensor) {
+    LOG(INFO) << "[DSV4][Node] layer=" << layer_id << " node=" << node
+              << " shape=" << tensor_shape_string(tensor)
+              << " dtype_device=" << tensor_dtype_device_string(tensor);
+  };
+  const auto dump_node_tensor = [&](const std::string& node,
+                                    const torch::Tensor& tensor) {
+    if (should_dump_layer0 && !rope_layer_dump_dir.empty()) {
+      dump_rope_tensor(rope_layer_dump_dir, node, tensor);
+    }
+  };
+  const auto dump_module_tensor = [&](const std::string& module_name,
+                                      const std::string& node,
+                                      const torch::Tensor& tensor) {
+    if (should_dump_layer0 && !rope_layer_dump_dir.empty()) {
+      dump_rope_module_tensor(rope_layer_dump_dir, module_name, node, tensor);
+    }
+  };
+
+  LOG(INFO) << "[DSV4][HeadDim][AttentionForward] layer=" << layer_id
+            << " attention_head_dim=" << head_dim_
+            << " rope_head_dim=" << rope_head_dim_
+            << " nope_head_dim=" << nope_head_dim_
+            << " qk_head_dim=" << qk_head_dim_
+            << " hidden_states=" << tensor_shape_string(hidden_states)
+            << " cos=" << tensor_shape_string(attn_metadata.cos)
+            << " sin=" << tensor_shape_string(attn_metadata.sin);
+  log_node_tensor("hidden_states.input", hidden_states);
+  log_node_tensor("cos.input", attn_metadata.cos);
+  log_node_tensor("sin.input", attn_metadata.sin);
+  dump_node_tensor("hidden_states.input", hidden_states);
+  dump_node_tensor("cos.input", attn_metadata.cos);
+  dump_node_tensor("sin.input", attn_metadata.sin);
 
   // 1) q projection + q rmsnorm
   auto q_down = q_a_proj_->forward(hidden_states);
+  log_node_tensor("q_a_proj.output", q_down);
+  dump_node_tensor("q_a_proj.output", q_down);
   auto qr = std::get<0>(q_layernorm_->forward(q_down));
+  log_node_tensor("q_layernorm.output", qr);
+  dump_node_tensor("q_layernorm.output", qr);
   auto q = q_b_proj_->forward(qr).view({-1, n_local_heads_, head_dim_});
+  log_node_tensor("q_b_proj_reshape.output", q);
+  dump_node_tensor("q_b_proj_reshape.output", q);
 
   xllm::kernel::FusedLayerNormParams q_rmsnorm_params;
   q_rmsnorm_params.input = q;
@@ -465,22 +764,61 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   q_rmsnorm_params.eps = eps_;
   xllm::kernel::fused_layernorm(q_rmsnorm_params);
   q = q_rmsnorm_params.output;
+  log_node_tensor("q_rmsnorm.output", q);
+  dump_node_tensor("q_rmsnorm.output", q);
 
   // 2) kv projection
   auto kv_down = kv_proj_->forward(hidden_states);
+  log_node_tensor("kv_proj.output", kv_down);
+  dump_node_tensor("kv_proj.output", kv_down);
   auto kv = std::get<0>(kv_layernorm_->forward(kv_down));
+  log_node_tensor("kv_layernorm.output", kv);
+  dump_node_tensor("kv_layernorm.output", kv);
   kv = kv.view({-1, 1, qk_head_dim_});
+  log_node_tensor("kv_reshape.output", kv);
+  dump_node_tensor("kv_reshape.output", kv);
 
   // 3) RoPE (q and kv)
   auto cos = attn_metadata.cos;
   auto sin = attn_metadata.sin;
-  apply_partial_rope(q, nope_head_dim_, rope_head_dim_, cos, sin);
-  apply_partial_rope(kv, nope_head_dim_, rope_head_dim_, cos, sin);
+  apply_partial_rope(q,
+                     nope_head_dim_,
+                     rope_head_dim_,
+                     cos,
+                     sin,
+                     /*inverse=*/false,
+                     layer_id,
+                     "q_forward_rope",
+                     rope_layer_dump_dir);
+  log_node_tensor("q_after_rope.output", q);
+  dump_node_tensor("q_after_rope.output", q);
+  apply_partial_rope(kv,
+                     nope_head_dim_,
+                     rope_head_dim_,
+                     cos,
+                     sin,
+                     /*inverse=*/false,
+                     layer_id,
+                     "kv_forward_rope",
+                     rope_layer_dump_dir);
+  log_node_tensor("kv_after_rope.output", kv);
+  dump_node_tensor("kv_after_rope.output", kv);
 
   // 4) resolve per-layer cache mapping
   const int64_t compress_ratio_i = static_cast<int64_t>(compress_ratio_);
   DsaCacheMapping mapping =
       resolve_cache_mapping(attn_metadata, compress_ratio_i);
+  LOG(INFO) << "[DSV4][DSA][CacheMapping] layer=" << layer_id
+            << " compress_ratio=" << compress_ratio_i
+            << " cmp_cache_idx=" << mapping.cmp_cache_idx
+            << " index_cache_idx=" << mapping.index_cache_idx
+            << " indexer_scale_cache_idx=" << mapping.indexer_scale_cache_idx
+            << " ori_cache_idx=" << mapping.ori_cache_idx
+            << " kv_state_cache_idx=" << mapping.kv_state_cache_idx
+            << " score_state_cache_idx=" << mapping.score_state_cache_idx
+            << " index_kv_state_cache_idx=" << mapping.index_kv_state_cache_idx
+            << " index_score_state_cache_idx="
+            << mapping.index_score_state_cache_idx;
 
   auto cmp_block_table = get_layer_cache_tensor(attn_metadata.block_tables,
                                                 attn_metadata.layer_id,
@@ -516,6 +854,43 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   auto index_slot = get_layer_cache_tensor(attn_metadata.slot_mappings,
                                            attn_metadata.layer_id,
                                            mapping.index_cache_idx);
+  LOG(INFO) << "[DSV4][DSA][LayerInputs] layer=" << layer_id
+            << " cmp_block_table=" << tensor_shape_string(cmp_block_table)
+            << "/" << tensor_dtype_device_string(cmp_block_table)
+            << " ori_block_table=" << tensor_shape_string(ori_block_table)
+            << "/" << tensor_dtype_device_string(ori_block_table)
+            << " kv_block_table=" << tensor_shape_string(kv_block_table) << "/"
+            << tensor_dtype_device_string(kv_block_table)
+            << " score_block_table=" << tensor_shape_string(score_block_table)
+            << "/" << tensor_dtype_device_string(score_block_table)
+            << " index_kv_block_table="
+            << tensor_shape_string(index_kv_block_table) << "/"
+            << tensor_dtype_device_string(index_kv_block_table)
+            << " index_score_block_table="
+            << tensor_shape_string(index_score_block_table) << "/"
+            << tensor_dtype_device_string(index_score_block_table)
+            << " index_block_table=" << tensor_shape_string(index_block_table)
+            << "/" << tensor_dtype_device_string(index_block_table)
+            << " cmp_slot=" << tensor_shape_string(cmp_slot) << "/"
+            << tensor_dtype_device_string(cmp_slot)
+            << " ori_slot=" << tensor_shape_string(ori_slot) << "/"
+            << tensor_dtype_device_string(ori_slot)
+            << " index_slot=" << tensor_shape_string(index_slot) << "/"
+            << tensor_dtype_device_string(index_slot);
+  dump_module_tensor("dsa_layer_inputs", "cmp_block_table", cmp_block_table);
+  dump_module_tensor("dsa_layer_inputs", "ori_block_table", ori_block_table);
+  dump_module_tensor("dsa_layer_inputs", "kv_block_table", kv_block_table);
+  dump_module_tensor(
+      "dsa_layer_inputs", "score_block_table", score_block_table);
+  dump_module_tensor(
+      "dsa_layer_inputs", "index_kv_block_table", index_kv_block_table);
+  dump_module_tensor(
+      "dsa_layer_inputs", "index_score_block_table", index_score_block_table);
+  dump_module_tensor(
+      "dsa_layer_inputs", "index_block_table", index_block_table);
+  dump_module_tensor("dsa_layer_inputs", "cmp_slot", cmp_slot);
+  dump_module_tensor("dsa_layer_inputs", "ori_slot", ori_slot);
+  dump_module_tensor("dsa_layer_inputs", "index_slot", index_slot);
 
   auto ori_kv = std::get<0>(kv_state);
   if (!ori_kv.defined()) {
@@ -541,6 +916,25 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   if (!index_score_state.defined()) {
     index_score_state = kv_cache.get_compress_index_score_state();
   }
+  LOG(INFO) << "[DSV4][DSA][KVState] layer=" << layer_id
+            << " ori_kv=" << tensor_shape_string(ori_kv) << "/"
+            << tensor_dtype_device_string(ori_kv) << " compressor_kv_state="
+            << tensor_shape_string(compressor_kv_state) << "/"
+            << tensor_dtype_device_string(compressor_kv_state)
+            << " compressor_score_state="
+            << tensor_shape_string(compressor_score_state) << "/"
+            << tensor_dtype_device_string(compressor_score_state)
+            << " index_kv_state=" << tensor_shape_string(index_kv_state) << "/"
+            << tensor_dtype_device_string(index_kv_state)
+            << " index_score_state=" << tensor_shape_string(index_score_state)
+            << "/" << tensor_dtype_device_string(index_score_state);
+  dump_module_tensor("dsa_kv_state", "ori_kv", ori_kv);
+  dump_module_tensor(
+      "dsa_kv_state", "compressor_kv_state", compressor_kv_state);
+  dump_module_tensor(
+      "dsa_kv_state", "compressor_score_state", compressor_score_state);
+  dump_module_tensor("dsa_kv_state", "index_kv_state", index_kv_state);
+  dump_module_tensor("dsa_kv_state", "index_score_state", index_score_state);
 
   // 5) write ori kv cache
   scatter_by_slot(ori_kv, ori_slot, kv);
@@ -560,6 +954,25 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       compress_sin = attn_metadata.c128_sin;
     }
 
+    LOG(INFO) << "[DSV4][RoPE][CompressorInputs] layer=" << layer_id
+              << " compress_ratio=" << compress_ratio_i
+              << " hidden_states=" << tensor_shape_string(hidden_states)
+              << " compress_sin=" << tensor_shape_string(compress_sin) << "/"
+              << tensor_dtype_device_string(compress_sin)
+              << " compress_cos=" << tensor_shape_string(compress_cos) << "/"
+              << tensor_dtype_device_string(compress_cos)
+              << " actual_seq_lengths_query="
+              << tensor_shape_string(attn_metadata.actual_seq_lengths_query);
+    dump_rope_tensor(
+        rope_layer_dump_dir, "compressor.hidden_states.input", hidden_states);
+    dump_rope_tensor(
+        rope_layer_dump_dir, "compressor.compress_sin.input", compress_sin);
+    dump_rope_tensor(
+        rope_layer_dump_dir, "compressor.compress_cos.input", compress_cos);
+    dump_rope_tensor(rope_layer_dump_dir,
+                     "compressor.actual_seq_lengths_query.input",
+                     attn_metadata.actual_seq_lengths_query);
+
     std::tuple<torch::Tensor, torch::Tensor> compressor_states{
         compressor_kv_state, compressor_score_state};
     std::tuple<torch::Tensor, torch::Tensor> compressor_block_tables{
@@ -573,6 +986,11 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                              compress_sin,
                              compress_cos,
                              attn_metadata.actual_seq_lengths_query);
+    LOG(INFO) << "[DSV4][RoPE][CompressorOutput] layer=" << layer_id
+              << " compressed_kv=" << tensor_shape_string(compressed_kv) << "/"
+              << tensor_dtype_device_string(compressed_kv);
+    dump_rope_tensor(
+        rope_layer_dump_dir, "compressor.compressed_kv.output", compressed_kv);
     scatter_by_slot(cmp_kv, cmp_slot, compressed_kv);
   }
 
@@ -590,6 +1008,22 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     CHECK(qli_metadata.defined()) << "DSAttention requires precomputed "
                                      "qli_metadata for compress_ratio==4.";
     auto qli_metadata_opt = std::optional<torch::Tensor>(qli_metadata);
+    LOG(INFO) << "[DSV4][RoPE][IndexerInputs] layer=" << layer_id
+              << " cos=" << tensor_shape_string(cos) << "/"
+              << tensor_dtype_device_string(cos)
+              << " sin=" << tensor_shape_string(sin) << "/"
+              << tensor_dtype_device_string(sin)
+              << " c4_cos=" << tensor_shape_string(attn_metadata.c4_cos) << "/"
+              << tensor_dtype_device_string(attn_metadata.c4_cos)
+              << " c4_sin=" << tensor_shape_string(attn_metadata.c4_sin) << "/"
+              << tensor_dtype_device_string(attn_metadata.c4_sin);
+    dump_rope_tensor(rope_layer_dump_dir, "indexer.qr.input", qr);
+    dump_rope_tensor(rope_layer_dump_dir, "indexer.cos.input", cos);
+    dump_rope_tensor(rope_layer_dump_dir, "indexer.sin.input", sin);
+    dump_rope_tensor(
+        rope_layer_dump_dir, "indexer.c4_cos.input", attn_metadata.c4_cos);
+    dump_rope_tensor(
+        rope_layer_dump_dir, "indexer.c4_sin.input", attn_metadata.c4_sin);
     compress_topk_idxs =
         indexer_->select_qli(hidden_states,
                              qr,
@@ -606,6 +1040,13 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                              isprefill,
                              &indexer_states,
                              &indexer_block_tables);
+    LOG(INFO) << "[DSV4][RoPE][IndexerOutput] layer=" << layer_id
+              << " compress_topk_idxs="
+              << tensor_shape_string(compress_topk_idxs) << "/"
+              << tensor_dtype_device_string(compress_topk_idxs);
+    dump_rope_tensor(rope_layer_dump_dir,
+                     "indexer.compress_topk_idxs.output",
+                     compress_topk_idxs);
     CHECK(compress_topk_idxs.defined())
         << "DSAttention indexer returned undefined topk indices for "
            "compress_ratio==4.";
@@ -624,6 +1065,36 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   CHECK(sparse_metadata.has_value())
       << "DSAttention requires precomputed sparse metadata for compress_ratio="
       << compress_ratio_i;
+  LOG(INFO)
+      << "[DSV4][SparseAttn][Inputs] layer=" << layer_id
+      << " q=" << tensor_shape_string(q) << "/" << tensor_dtype_device_string(q)
+      << " ori_kv=" << tensor_shape_string(ori_kv) << "/"
+      << tensor_dtype_device_string(ori_kv)
+      << " cmp_kv=" << tensor_shape_string(cmp_kv) << "/"
+      << tensor_dtype_device_string(cmp_kv)
+      << " compress_topk_idxs=" << tensor_shape_string(compress_topk_idxs)
+      << "/" << tensor_dtype_device_string(compress_topk_idxs)
+      << " actual_seq_lengths_query="
+      << tensor_shape_string(attn_metadata.actual_seq_lengths_query) << "/"
+      << tensor_dtype_device_string(attn_metadata.actual_seq_lengths_query)
+      << " actual_seq_lengths_kv="
+      << tensor_shape_string(attn_metadata.actual_seq_lengths_kv) << "/"
+      << tensor_dtype_device_string(attn_metadata.actual_seq_lengths_kv)
+      << " sparse_metadata=" << tensor_shape_string(sparse_metadata.value())
+      << "/" << tensor_dtype_device_string(sparse_metadata.value());
+  dump_module_tensor("sparse_attn_inputs", "q", q);
+  dump_module_tensor("sparse_attn_inputs", "ori_kv", ori_kv);
+  dump_module_tensor("sparse_attn_inputs", "cmp_kv", cmp_kv);
+  dump_module_tensor(
+      "sparse_attn_inputs", "compress_topk_idxs", compress_topk_idxs);
+  dump_module_tensor("sparse_attn_inputs",
+                     "actual_seq_lengths_query",
+                     attn_metadata.actual_seq_lengths_query);
+  dump_module_tensor("sparse_attn_inputs",
+                     "actual_seq_lengths_kv",
+                     attn_metadata.actual_seq_lengths_kv);
+  dump_module_tensor(
+      "sparse_attn_inputs", "sparse_metadata", sparse_metadata.value());
 
   auto [attn_output, output_lse] = xllm::kernel::npu::sparse_attn_sharedkv(
       /*q=*/q,
@@ -653,17 +1124,38 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       /*layout_q=*/"TND",
       /*layout_kv=*/"PA_ND",
       /*return_softmax_lse=*/false);
+  log_node_tensor("sparse_attn.output", attn_output);
+  dump_node_tensor("sparse_attn.output", attn_output);
+  log_node_tensor("sparse_attn.lse", output_lse);
+  dump_node_tensor("sparse_attn.lse", output_lse);
 
   // 8) output RoPE + projection
   auto o = attn_output.view({-1, n_local_heads_, head_dim_});
-  apply_partial_rope(
-      o, nope_head_dim_, rope_head_dim_, cos, sin, /*inverse=*/true);
+  log_node_tensor("o_reshape.input", o);
+  dump_node_tensor("o_reshape.input", o);
+  apply_partial_rope(o,
+                     nope_head_dim_,
+                     rope_head_dim_,
+                     cos,
+                     sin,
+                     /*inverse=*/true,
+                     layer_id,
+                     "o_inverse_rope",
+                     rope_layer_dump_dir);
+  log_node_tensor("o_after_inverse_rope.output", o);
+  dump_node_tensor("o_after_inverse_rope.output", o);
 
   const int64_t num_tokens = o.size(0);
   auto o_group = o.view({num_tokens, n_local_groups_, -1});
+  log_node_tensor("o_group.output", o_group);
+  dump_node_tensor("o_group.output", o_group);
   auto wo_a = o_a_proj_->weight().view({n_local_groups_, o_lora_rank_, -1});
   auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
+  log_node_tensor("o_low_rank.output", o_low_rank);
+  dump_node_tensor("o_low_rank.output", o_low_rank);
   auto output = o_b_proj_->forward(o_low_rank.reshape({num_tokens, -1}));
+  log_node_tensor("o_b_proj.output", output);
+  dump_node_tensor("o_b_proj.output", output);
   std::optional<torch::Tensor> final_lse = std::nullopt;
   (void)output_lse;
 

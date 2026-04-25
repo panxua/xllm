@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "executor.h"
 
+#include <c10/core/InferenceMode.h>
+
 #include "common/global_flags.h"
 #include "executor_impl_factory.h"
 #include "platform/device.h"
@@ -40,6 +42,7 @@ ModelOutput Executor::forward(const torch::Tensor& tokens,
                               const torch::Tensor& positions,
                               std::vector<KVCache>& kv_caches,
                               const ModelInputParams& params) {
+  c10::InferenceMode guard(true);
   return impl_->run(tokens, positions, kv_caches, params);
 }
 

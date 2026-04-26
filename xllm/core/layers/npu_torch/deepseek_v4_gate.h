@@ -44,13 +44,6 @@ class DeepseekV4GateImpl : public torch::nn::Module {
 
   bool is_hash_layer() const { return hash_layer_; }
 
-  const torch::Tensor& debug_last_router_logits() const {
-    return debug_last_router_logits_;
-  }
-  const torch::Tensor& debug_last_scores() const {
-    return debug_last_scores_;
-  }
-
  private:
   std::tuple<torch::Tensor, torch::Tensor> select_experts_native(
       const torch::Tensor& router_logits,
@@ -69,9 +62,6 @@ class DeepseekV4GateImpl : public torch::nn::Module {
   torch::Tensor weight_;
   torch::Tensor tid2eid_;
   torch::Tensor bias_;
-
-  torch::Tensor debug_last_router_logits_;
-  torch::Tensor debug_last_scores_;
 };
 
 TORCH_MODULE(DeepseekV4Gate);

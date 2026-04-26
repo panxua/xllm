@@ -338,19 +338,9 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
       << "DeepseekV4DecoderLayer requires DSA metadata for DSAttention path.";
 
   auto residual_attn = x;
-  log_moe_tensor("residual_attn.input", residual_attn);
-  // dump_moe_tensor("residual_attn.input", residual_attn);
   auto [attn_input, post_attn, comb_attn] =
       hc_pre(x, hc_attn_fn_, hc_attn_scale_, hc_attn_base_);
-  log_moe_tensor("hc_pre_attn.output", attn_input);
-  log_moe_tensor("hc_pre_attn.post", post_attn);
-  log_moe_tensor("hc_pre_attn.comb", comb_attn);
-  // dump_moe_tensor("hc_pre_attn.output", attn_input);
-  // dump_moe_tensor("hc_pre_attn.post", post_attn);
-  // dump_moe_tensor("hc_pre_attn.comb", comb_attn);
   attn_input = std::get<0>(attn_norm_->forward(attn_input));
-  log_moe_tensor("attn_norm.output", attn_input);
-  // dump_moe_tensor("attn_norm.output", attn_input);
 
   auto& dsa = *(attn_metadata.dsa_metadata);
   const auto compress_metadata = std::make_tuple(
@@ -370,26 +360,12 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
       compress_metadata);
   (void)attn_lse;
   attn_input = attn_output;
-  log_moe_tensor("attn_output.output", attn_output);
-  dump_moe_tensor("attn_output.output", attn_output);
   x = hc_post(attn_input, residual_attn, post_attn, comb_attn);
-  log_moe_tensor("hc_post_attn.output", x);
-  dump_moe_tensor("hc_post_attn.output", x);
 
   auto residual_ffn = x;
-  log_moe_tensor("residual_ffn.input", residual_ffn);
-  dump_moe_tensor("residual_ffn.input", residual_ffn);
   auto [ffn_input, post_ffn, comb_ffn] =
       hc_pre(x, hc_ffn_fn_, hc_ffn_scale_, hc_ffn_base_);
-  log_moe_tensor("hc_pre_ffn.output", ffn_input);
-  log_moe_tensor("hc_pre_ffn.post", post_ffn);
-  log_moe_tensor("hc_pre_ffn.comb", comb_ffn);
-  dump_moe_tensor("hc_pre_ffn.output", ffn_input);
-  dump_moe_tensor("hc_pre_ffn.post", post_ffn);
-  dump_moe_tensor("hc_pre_ffn.comb", comb_ffn);
   ffn_input = std::get<0>(ffn_norm_->forward(ffn_input));
-  log_moe_tensor("ffn_norm.output", ffn_input);
-  dump_moe_tensor("ffn_norm.output", ffn_input);
 
   auto ffn_input_2d = ffn_input.reshape({-1, ffn_input.size(-1)});
   log_moe_tensor("ffn_input_2d.input", ffn_input_2d);
@@ -411,7 +387,7 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   }
   if (gate_input_ids.has_value()) {
     log_moe_tensor("gate_input_ids.input", gate_input_ids.value());
-    dump_moe_tensor("gate_input_ids.input", gate_input_ids.value());
+    dump_moe_tensor("gate_input_ids_after_comm", gate_input_ids.value());
   } else {
     log_moe_tensor("gate_input_ids.input", torch::Tensor());
   }
@@ -419,15 +395,35 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
     CHECK(gate_input_ids.has_value())
         << "DeepseekV4 hash gate requires input_ids for routing";
   }
+
+  dump_moe_tensor("gate_weight", gate_->get_weight());
+  if (gate_->is_hash_layer()) {
+    dump_moe_tensor("gate_tid2eid", gate_->get_tid2eid());
+  } else {
+    dump_moe_tensor("gate_e_score_correction_bias", gate_->get_bias());
+  }
+
   auto [topk_weights, topk_ids] = gate_->forward(ffn_input_2d, gate_input_ids);
-  log_moe_tensor("router_logits.output", gate_->debug_last_router_logits());
-  log_moe_tensor("gate_scores.output", gate_->debug_last_scores());
-  dump_moe_tensor("router_logits.output", gate_->debug_last_router_logits());
-  dump_moe_tensor("gate_scores.output", gate_->debug_last_scores());
+
+  dump_moe_tensor("gate_router_logits", gate_->debug_last_router_logits());
+  dump_moe_tensor("gate_router_logits_before_hash_gating",
+                   gate_->debug_last_router_logits());
+  dump_moe_tensor("gate_scores", gate_->debug_last_scores());
+  dump_moe_tensor("gate_hash_topk_weights", topk_weights);
+  dump_moe_tensor("gate_hash_topk_ids", topk_ids);
   log_moe_tensor("topk_weights.output", topk_weights);
   log_moe_tensor("topk_ids.output", topk_ids);
-  dump_moe_tensor("topk_weights.output", topk_weights);
-  dump_moe_tensor("topk_ids.output", topk_ids);
+
+  dump_moe_tensor("w8a8_input_hidden_states", ffn_input_2d);
+  dump_moe_tensor("w8a8_topk_ids", topk_ids);
+  dump_moe_tensor("w8a8_topk_weights", topk_weights);
+  if (moe_mlp_->is_w8a8_dynamic()) {
+    dump_moe_tensor("w8a8_w13_weight", moe_mlp_->get_w13());
+    dump_moe_tensor("w8a8_w2_weight", moe_mlp_->get_w2());
+    dump_moe_tensor("w8a8_w13_weight_scale", moe_mlp_->get_w13_scale());
+    dump_moe_tensor("w8a8_w2_weight_scale", moe_mlp_->get_w2_scale());
+  }
+
   ffn_input = moe_mlp_->forward_with_selected_experts(
       ffn_input, topk_weights, topk_ids, input_params);
   const auto& shared_output_pre = moe_mlp_->debug_last_shared_output_pre();
@@ -436,14 +432,30 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   log_moe_tensor("shared_output_pre.output", shared_output_pre);
   log_moe_tensor("shared_gate.output", shared_gate);
   log_moe_tensor("shared_output.output", shared_output);
-  dump_moe_tensor("shared_output_pre.output", shared_output_pre);
-  dump_moe_tensor("shared_gate.output", shared_gate);
-  dump_moe_tensor("shared_output.output", shared_output);
+  dump_moe_tensor("shared_experts_output", shared_output);
+  dump_moe_tensor("routed_experts_output",
+                   moe_mlp_->debug_last_routed_output());
+  dump_moe_tensor("moe_final_output_before_allreduce",
+                   moe_mlp_->debug_last_moe_final_before_reduce());
+  if (moe_mlp_->is_w8a8_dynamic()) {
+    dump_moe_tensor("quant_mlp_input", moe_mlp_->debug_last_quant_input());
+    dump_moe_tensor("quant_mlp_group_list", moe_mlp_->debug_last_group_list());
+    dump_moe_tensor("gmm1_swiglu_output", moe_mlp_->debug_last_gmm1_out());
+    dump_moe_tensor("gmm1_swiglu_out_scale", moe_mlp_->debug_last_act_scale());
+    dump_moe_tensor("gmm2_down_proj_output", moe_mlp_->debug_last_gmm2_out());
+  } else {
+    dump_moe_tensor("else_branch_gmm1_swiglu_output",
+                     moe_mlp_->debug_last_gmm1_out());
+    dump_moe_tensor("else_branch_gmm2_down_proj_output",
+                     moe_mlp_->debug_last_gmm2_out());
+  }
+  dump_moe_tensor("shared_fused_moe_input_hidden_states", ffn_input_2d);
+  dump_moe_tensor("shared_fused_moe_routed_out",
+                   moe_mlp_->debug_last_routed_output());
+  dump_moe_tensor("shared_fused_moe_shared_expert_out", shared_output);
   log_moe_tensor("moe_output.output", ffn_input);
   dump_moe_tensor("moe_output.output", ffn_input);
   x = hc_post(ffn_input, residual_ffn, post_ffn, comb_ffn);
-  log_moe_tensor("hc_post_ffn.output", x);
-  dump_moe_tensor("hc_post_ffn.output", x);
 
   return x;
 }

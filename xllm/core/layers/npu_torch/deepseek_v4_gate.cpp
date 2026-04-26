@@ -136,7 +136,6 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
       << hidden_size_ << " got " << hidden_states.size(-1);
 
   auto logits = torch::matmul(hidden_states, weight_.transpose(0, 1));
-  debug_last_router_logits_ = logits.detach();
 
   constexpr bool renormalize = true;
   const int64_t norm_type = score_func_to_norm_type(score_func_);
@@ -144,18 +143,7 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
       check_npu_moe_gating_top_k(hidden_states, topk_, renormalize, norm_type);
 
   if (!is_support_npu_moe_gating_top_k) {
-    torch::Tensor native_scores;
-    if (norm_type == 0) {
-      native_scores = torch::softmax(logits, -1);
-    } else if (norm_type == 1) {
-      native_scores = torch::sigmoid(logits);
-    } else {
-      native_scores = torch::softplus(logits).sqrt();
-    }
-    debug_last_scores_ = native_scores.detach();
-    auto [topk_weights, topk_ids] =
-        select_experts_native(logits, input_ids);
-    return std::make_tuple(topk_weights, topk_ids);
+    return select_experts_native(logits, input_ids);
   }
 
   kernel::MoeGatingTopKHashParams gate_params;
@@ -190,7 +178,7 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
   }
   auto [topk_weights, topk_idx, score_out] =
       kernel::moe_gating_top_k_hash(gate_params);
-  debug_last_scores_ = score_out.defined() ? score_out.detach() : torch::Tensor();
+  (void)score_out;
 
   if (gate_params.norm_type == 0 && renormalize) {
     topk_weights = renormalize_topk_weights(topk_weights);

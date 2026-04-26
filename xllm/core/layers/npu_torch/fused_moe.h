@@ -58,6 +58,36 @@ class FusedMoEImpl : public torch::nn::Module {
   const torch::Tensor& debug_last_shared_gate() const;
   const torch::Tensor& debug_last_shared_output() const;
 
+  const torch::Tensor& debug_last_quant_input() const {
+    return debug_last_quant_input_;
+  }
+  const torch::Tensor& debug_last_group_list() const {
+    return debug_last_group_list_;
+  }
+  const torch::Tensor& debug_last_gmm1_out() const {
+    return debug_last_gmm1_out_;
+  }
+  const torch::Tensor& debug_last_act_quant() const {
+    return debug_last_act_quant_;
+  }
+  const torch::Tensor& debug_last_act_scale() const {
+    return debug_last_act_scale_;
+  }
+  const torch::Tensor& debug_last_gmm2_out() const {
+    return debug_last_gmm2_out_;
+  }
+  const torch::Tensor& debug_last_routed_output() const {
+    return debug_last_routed_output_;
+  }
+  const torch::Tensor& debug_last_moe_final_before_reduce() const {
+    return debug_last_moe_final_before_reduce_;
+  }
+  const torch::Tensor& get_w13() const { return w13_; }
+  const torch::Tensor& get_w2() const { return w2_; }
+  const torch::Tensor& get_w13_scale() const { return w13_scale_; }
+  const torch::Tensor& get_w2_scale() const { return w2_scale_; }
+  bool is_w8a8_dynamic() const;
+
  private:
   // struct to store the selected expert info
   struct SelectedExpertInfo {
@@ -94,6 +124,15 @@ class FusedMoEImpl : public torch::nn::Module {
   torch::Tensor debug_last_shared_output_pre_;
   torch::Tensor debug_last_shared_gate_;
   torch::Tensor debug_last_shared_output_;
+
+  torch::Tensor debug_last_quant_input_;
+  torch::Tensor debug_last_group_list_;
+  torch::Tensor debug_last_gmm1_out_;
+  torch::Tensor debug_last_act_quant_;
+  torch::Tensor debug_last_act_scale_;
+  torch::Tensor debug_last_gmm2_out_;
+  torch::Tensor debug_last_routed_output_;
+  torch::Tensor debug_last_moe_final_before_reduce_;
 
   int64_t num_experts_per_rank_;
   int64_t start_expert_id_;

@@ -239,6 +239,10 @@ const torch::Tensor& FusedMoEImpl::debug_last_shared_output() const {
   return debug_last_shared_output_;
 }
 
+bool FusedMoEImpl::is_w8a8_dynamic() const {
+  return is_w8a8_dynamic_quant_method(resolved_moe_quant_method_);
+}
+
 FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
                            const FusedMoEArgs& moe_args,
                            const QuantArgs& quant_args,
@@ -498,6 +502,15 @@ torch::Tensor FusedMoEImpl::forward_expert(
   torch::Tensor router_logits_2d =
       router_logits.reshape({-1, router_logits.size(-1)});
 
+  debug_last_quant_input_ = torch::Tensor();
+  debug_last_group_list_ = torch::Tensor();
+  debug_last_gmm1_out_ = torch::Tensor();
+  debug_last_act_quant_ = torch::Tensor();
+  debug_last_act_scale_ = torch::Tensor();
+  debug_last_gmm2_out_ = torch::Tensor();
+  debug_last_routed_output_ = torch::Tensor();
+  debug_last_moe_final_before_reduce_ = torch::Tensor();
+
   // Step 1-3: select experts
   SelectedExpertInfo selected_expert_info;
   torch::Tensor expand_hidden_states =
@@ -521,6 +534,9 @@ torch::Tensor FusedMoEImpl::forward_expert(
     CHECK(pertoken_scale.has_value() && pertoken_scale->defined())
         << "dynamic_quant must return per-token scale for W8A8 fused MoE.";
 
+    debug_last_quant_input_ = quantized_expand_hidden_states.detach();
+    debug_last_group_list_ = selected_expert_info.token_count_slice.detach();
+
     // Step 5: first grouped matmul (int32 output expected for dequant+swiglu).
     if (w13_.size(1) != quantized_expand_hidden_states.size(1)) {
       w13_ = w13_.transpose(1, 2);
@@ -540,6 +556,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
       gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
     }
 
+    debug_last_gmm1_out_ = gemm1_out.detach();
+
     // Step 6: fused dequant + swiglu + quant.
     torch::Tensor act_quantized;
     torch::Tensor act_scale;
@@ -554,6 +572,9 @@ torch::Tensor FusedMoEImpl::forward_expert(
       std::tie(act_quantized, act_scale) =
           xllm::kernel::dequant_swiglu_quant(params);
     }
+
+    debug_last_act_quant_ = act_quantized.detach();
+    debug_last_act_scale_ = act_scale.detach();
 
     // Step 7: second grouped matmul (dequant to hidden dtype).
     if (w2_.size(1) != act_quantized.size(1)) {
@@ -578,6 +599,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
       gemm2_out = xllm::kernel::group_gemm(group_gemm_params);
     }
   } else {
+    debug_last_group_list_ =
+        selected_expert_info.token_count_slice.to(torch::kInt64).detach();
     // Step 4: group gemm 1
     {
       xllm::kernel::GroupGemmParams group_gemm_params;
@@ -593,6 +616,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
       group_gemm_params.group_list_type = 1;
       gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
     }
+
+    debug_last_gmm1_out_ = gemm1_out.detach();
 
     // Step 5: activation
     torch::Tensor act_out;

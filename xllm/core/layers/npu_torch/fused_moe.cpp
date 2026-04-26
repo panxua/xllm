@@ -647,6 +647,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
     }
   }
 
+  debug_last_gmm2_out_ = gemm2_out.detach();
+
   // Step 8: combine the intermediate results and get the final hidden states
   torch::Tensor final_hidden_states;
   xllm::kernel::MoeCombineResultParams moe_combine_params;
@@ -654,11 +656,14 @@ torch::Tensor FusedMoEImpl::forward_expert(
   moe_combine_params.reduce_weight = selected_expert_info.reduce_weight;
   moe_combine_params.gather_ids = selected_expert_info.combine_idx;
   final_hidden_states = xllm::kernel::moe_combine_result(moe_combine_params);
+  debug_last_routed_output_ = final_hidden_states.detach();
   if (shared_output.has_value()) {
     final_hidden_states = final_hidden_states + shared_output.value();
   }
   // reshape the final hidden states to the original shape
   final_hidden_states = final_hidden_states.reshape(hidden_states_shape);
+
+  debug_last_moe_final_before_reduce_ = final_hidden_states.detach();
 
   if (tp_pg_->world_size() > 1) {
     final_hidden_states = parallel_state::reduce(final_hidden_states, tp_pg_);

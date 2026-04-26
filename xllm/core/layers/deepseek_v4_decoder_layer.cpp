@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 
 #include "kernels/ops_api.h"
+#include "util/tensor_dump.h"
 
 namespace xllm {
 namespace layer {
@@ -60,6 +61,7 @@ DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
   hc_sinkhorn_iters_ = args.hc_sinkhorn_iters();
   hc_eps_ = static_cast<double>(args.hc_eps());
   norm_eps_ = static_cast<double>(args.rms_norm_eps());
+  rank_ = parallel_args.rank();
 
   attention_ = register_module("attn", DSAttention(context, layer_id));
   attn_norm_ = register_module(
@@ -196,13 +198,36 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
 
   CHECK(attn_metadata.dsa_metadata)
       << "DeepseekV4DecoderLayer requires DSA metadata for DSAttention path.";
+  auto& dsa = *(attn_metadata.dsa_metadata);
+  const int64_t layer_id = dsa.layer_id;
+  tensor_dump::ScopedRankLayer dump_rank_layer_scope(rank_, layer_id);
+
+  tensor_dump::save_tensor(rank_, layer_id, "layer", "input", x);
+  tensor_dump::save_tensor(rank_, layer_id, "layer", "positions", positions);
+  tensor_dump::save_optional_tensor(
+      rank_, layer_id, "layer", "residual", residual);
 
   auto residual_attn = x;
+  tensor_dump::save_tensor(rank_, layer_id, "attn_hc_pre", "input_x", x);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_pre", "input_hc_fn", hc_attn_fn_);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_pre", "input_hc_scale", hc_attn_scale_);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_pre", "input_hc_base", hc_attn_base_);
   auto [attn_input, post_attn, comb_attn] =
       hc_pre(x, hc_attn_fn_, hc_attn_scale_, hc_attn_base_);
-  attn_input = std::get<0>(attn_norm_->forward(attn_input));
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_pre", "output_x", attn_input);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_pre", "output_post", post_attn);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_pre", "output_comb", comb_attn);
 
-  auto& dsa = *(attn_metadata.dsa_metadata);
+  tensor_dump::save_tensor(rank_, layer_id, "attn_norm", "input", attn_input);
+  attn_input = std::get<0>(attn_norm_->forward(attn_input));
+  tensor_dump::save_tensor(rank_, layer_id, "attn_norm", "output", attn_input);
+
   const auto compress_metadata = std::make_tuple(
       dsa.c1_metadata, dsa.c4_metadata, dsa.c128_metadata, dsa.qli_metadata);
   KVState kv_state{kv_cache.get_swa_cache(),
@@ -210,6 +235,15 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
                    kv_cache.get_compress_score_state(),
                    kv_cache.get_compress_index_kv_state(),
                    kv_cache.get_compress_index_score_state()};
+  tensor_dump::save_tensor(rank_, layer_id, "attention", "input", attn_input);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attention", "input_c1_metadata", dsa.c1_metadata);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attention", "input_c4_metadata", dsa.c4_metadata);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attention", "input_c128_metadata", dsa.c128_metadata);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attention", "input_qli_metadata", dsa.qli_metadata);
   auto [attn_output, attn_lse] = attention_->forward(
       dsa,
       attn_input,
@@ -218,14 +252,41 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
       attn_metadata.is_prefill || attn_metadata.is_chunked_prefill,
       std::to_string(dsa.layer_id),
       compress_metadata);
-  (void)attn_lse;
+  tensor_dump::save_tensor(rank_, layer_id, "attention", "output", attn_output);
+  tensor_dump::save_optional_tensor(
+      rank_, layer_id, "attention", "output_lse", attn_lse);
   attn_input = attn_output;
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_post", "input_x", attn_input);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_post", "input_residual", residual_attn);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_post", "input_post", post_attn);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "attn_hc_post", "input_comb", comb_attn);
   x = hc_post(attn_input, residual_attn, post_attn, comb_attn);
+  tensor_dump::save_tensor(rank_, layer_id, "attn_hc_post", "output", x);
 
   auto residual_ffn = x;
+  tensor_dump::save_tensor(rank_, layer_id, "ffn_hc_pre", "input_x", x);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_pre", "input_hc_fn", hc_ffn_fn_);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_pre", "input_hc_scale", hc_ffn_scale_);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_pre", "input_hc_base", hc_ffn_base_);
   auto [ffn_input, post_ffn, comb_ffn] =
       hc_pre(x, hc_ffn_fn_, hc_ffn_scale_, hc_ffn_base_);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_pre", "output_x", ffn_input);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_pre", "output_post", post_ffn);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_pre", "output_comb", comb_ffn);
+
+  tensor_dump::save_tensor(rank_, layer_id, "ffn_norm", "input", ffn_input);
   ffn_input = std::get<0>(ffn_norm_->forward(ffn_input));
+  tensor_dump::save_tensor(rank_, layer_id, "ffn_norm", "output", ffn_input);
 
   auto ffn_input_2d = ffn_input.reshape({-1, ffn_input.size(-1)});
   std::optional<torch::Tensor> gate_input_ids = std::nullopt;
@@ -247,10 +308,32 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
     CHECK(gate_input_ids.has_value())
         << "DeepseekV4 hash gate requires input_ids for routing";
   }
+  tensor_dump::save_tensor(rank_, layer_id, "gate", "input", ffn_input_2d);
+  tensor_dump::save_optional_tensor(
+      rank_, layer_id, "gate", "input_ids", gate_input_ids);
   auto [topk_weights, topk_ids] = gate_->forward(ffn_input_2d, gate_input_ids);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "gate", "output_topk_weights", topk_weights);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "gate", "output_topk_ids", topk_ids);
+  tensor_dump::save_tensor(rank_, layer_id, "ffn", "input", ffn_input);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn", "input_topk_weights", topk_weights);
+  tensor_dump::save_tensor(rank_, layer_id, "ffn", "input_topk_ids", topk_ids);
   ffn_input = moe_mlp_->forward_with_selected_experts(
       ffn_input, topk_weights, topk_ids, input_params);
+  tensor_dump::save_tensor(rank_, layer_id, "ffn", "output", ffn_input);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_post", "input_x", ffn_input);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_post", "input_residual", residual_ffn);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_post", "input_post", post_ffn);
+  tensor_dump::save_tensor(
+      rank_, layer_id, "ffn_hc_post", "input_comb", comb_ffn);
   x = hc_post(ffn_input, residual_ffn, post_ffn, comb_ffn);
+  tensor_dump::save_tensor(rank_, layer_id, "ffn_hc_post", "output", x);
+  tensor_dump::save_tensor(rank_, layer_id, "layer", "output", x);
 
   return x;
 }

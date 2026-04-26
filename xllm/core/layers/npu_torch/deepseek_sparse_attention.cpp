@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "kernels/ops_api.h"
+#include "util/tensor_dump.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 DECLARE_bool(enable_chunked_prefill);
@@ -347,7 +348,8 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
 
   q_a_proj_ = register_module(
       "q_a_proj",
-      ReplicatedLinear(hidden_size, q_lora_rank_, /*bias=*/false, quant_args, options));
+      ReplicatedLinear(
+          hidden_size, q_lora_rank_, /*bias=*/false, quant_args, options));
 
   q_layernorm_ =
       register_module("q_a_layernorm", RMSNorm(q_lora_rank_, eps_, options));
@@ -363,7 +365,8 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
 
   kv_proj_ = register_module(
       "kv_proj",
-      ReplicatedLinear(hidden_size, head_dim_, /*bias=*/false, quant_args, options));
+      ReplicatedLinear(
+          hidden_size, head_dim_, /*bias=*/false, quant_args, options));
   kv_layernorm_ =
       register_module("kv_layernorm", RMSNorm(head_dim_, eps_, options));
 
@@ -452,30 +455,59 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
 
   auto [c1_metadata, c4_metadata, c128_metadata, qli_metadata] =
       compress_metadata;
+  tensor_dump::save_tensor(
+      "attention/ds_attention", "input_hidden_states", hidden_states);
+  tensor_dump::save_tensor(
+      "attention/ds_attention", "input_c1_metadata", c1_metadata);
+  tensor_dump::save_tensor(
+      "attention/ds_attention", "input_c4_metadata", c4_metadata);
+  tensor_dump::save_tensor(
+      "attention/ds_attention", "input_c128_metadata", c128_metadata);
+  tensor_dump::save_tensor(
+      "attention/ds_attention", "input_qli_metadata", qli_metadata);
 
   // 1) q projection + q rmsnorm
+  tensor_dump::save_tensor("attention/q_a_proj", "input", hidden_states);
   auto q_down = q_a_proj_->forward(hidden_states);
+  tensor_dump::save_tensor("attention/q_a_proj", "output", q_down);
+  tensor_dump::save_tensor("attention/q_a_layernorm", "input", q_down);
   auto qr = std::get<0>(q_layernorm_->forward(q_down));
+  tensor_dump::save_tensor("attention/q_a_layernorm", "output", qr);
+  tensor_dump::save_tensor("attention/q_b_proj", "input", qr);
   auto q = q_b_proj_->forward(qr).view({-1, n_local_heads_, head_dim_});
+  tensor_dump::save_tensor("attention/q_b_proj", "output", q);
 
   xllm::kernel::FusedLayerNormParams q_rmsnorm_params;
   q_rmsnorm_params.input = q;
   q_rmsnorm_params.weight = q_rms_gamma_;
   q_rmsnorm_params.mode = "rmsnorm";
   q_rmsnorm_params.eps = eps_;
+  tensor_dump::save_tensor("attention/q_rmsnorm", "input", q);
+  tensor_dump::save_tensor("attention/q_rmsnorm", "weight", q_rms_gamma_);
   xllm::kernel::fused_layernorm(q_rmsnorm_params);
   q = q_rmsnorm_params.output;
+  tensor_dump::save_tensor("attention/q_rmsnorm", "output", q);
 
   // 2) kv projection
+  tensor_dump::save_tensor("attention/kv_proj", "input", hidden_states);
   auto kv_down = kv_proj_->forward(hidden_states);
+  tensor_dump::save_tensor("attention/kv_proj", "output", kv_down);
+  tensor_dump::save_tensor("attention/kv_layernorm", "input", kv_down);
   auto kv = std::get<0>(kv_layernorm_->forward(kv_down));
   kv = kv.view({-1, 1, qk_head_dim_});
+  tensor_dump::save_tensor("attention/kv_layernorm", "output", kv);
 
   // 3) RoPE (q and kv)
   auto cos = attn_metadata.cos;
   auto sin = attn_metadata.sin;
+  tensor_dump::save_tensor("attention/rope_q", "input", q);
+  tensor_dump::save_tensor("attention/rope", "cos", cos);
+  tensor_dump::save_tensor("attention/rope", "sin", sin);
   apply_partial_rope(q, nope_head_dim_, rope_head_dim_, cos, sin);
+  tensor_dump::save_tensor("attention/rope_q", "output", q);
+  tensor_dump::save_tensor("attention/rope_kv", "input", kv);
   apply_partial_rope(kv, nope_head_dim_, rope_head_dim_, cos, sin);
+  tensor_dump::save_tensor("attention/rope_kv", "output", kv);
 
   // 4) resolve per-layer cache mapping
   const int64_t compress_ratio_i = static_cast<int64_t>(compress_ratio_);
@@ -543,7 +575,12 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   }
 
   // 5) write ori kv cache
+  tensor_dump::save_tensor("attention/scatter_ori_kv", "input_cache", ori_kv);
+  tensor_dump::save_tensor(
+      "attention/scatter_ori_kv", "input_slot_mapping", ori_slot);
+  tensor_dump::save_tensor("attention/scatter_ori_kv", "input_value", kv);
   scatter_by_slot(ori_kv, ori_slot, kv);
+  tensor_dump::save_tensor("attention/scatter_ori_kv", "output_cache", ori_kv);
 
   // 6) optional compressor for cmp cache
   auto cmp_kv = kv_cache.get_k_cache();
@@ -565,6 +602,18 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     std::tuple<torch::Tensor, torch::Tensor> compressor_block_tables{
         kv_block_table, score_block_table};
 
+    tensor_dump::save_tensor(
+        "attention/compressor", "input_hidden_states", hidden_states);
+    tensor_dump::save_tensor(
+        "attention/compressor", "input_kv_state", compressor_kv_state);
+    tensor_dump::save_tensor(
+        "attention/compressor", "input_score_state", compressor_score_state);
+    tensor_dump::save_tensor(
+        "attention/compressor", "input_kv_block_table", kv_block_table);
+    tensor_dump::save_tensor(
+        "attention/compressor", "input_score_block_table", score_block_table);
+    tensor_dump::save_tensor("attention/compressor", "input_sin", compress_sin);
+    tensor_dump::save_tensor("attention/compressor", "input_cos", compress_cos);
     auto compressed_kv =
         compressor_->forward(attn_metadata,
                              hidden_states,
@@ -573,7 +622,16 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                              compress_sin,
                              compress_cos,
                              attn_metadata.actual_seq_lengths_query);
+    tensor_dump::save_tensor(
+        "attention/compressor", "output_compressed_kv", compressed_kv);
+    tensor_dump::save_tensor("attention/scatter_cmp_kv", "input_cache", cmp_kv);
+    tensor_dump::save_tensor(
+        "attention/scatter_cmp_kv", "input_slot_mapping", cmp_slot);
+    tensor_dump::save_tensor(
+        "attention/scatter_cmp_kv", "input_value", compressed_kv);
     scatter_by_slot(cmp_kv, cmp_slot, compressed_kv);
+    tensor_dump::save_tensor(
+        "attention/scatter_cmp_kv", "output_cache", cmp_kv);
   }
 
   torch::Tensor compress_topk_idxs;
@@ -590,6 +648,13 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     CHECK(qli_metadata.defined()) << "DSAttention requires precomputed "
                                      "qli_metadata for compress_ratio==4.";
     auto qli_metadata_opt = std::optional<torch::Tensor>(qli_metadata);
+    tensor_dump::save_tensor(
+        "attention/indexer", "input_hidden_states", hidden_states);
+    tensor_dump::save_tensor("attention/indexer", "input_qr", qr);
+    tensor_dump::save_tensor(
+        "attention/indexer", "input_index_cache", index_cache);
+    tensor_dump::save_tensor(
+        "attention/indexer", "input_indexer_cache_scale", indexer_cache_scale);
     compress_topk_idxs =
         indexer_->select_qli(hidden_states,
                              qr,
@@ -609,6 +674,8 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     CHECK(compress_topk_idxs.defined())
         << "DSAttention indexer returned undefined topk indices for "
            "compress_ratio==4.";
+    tensor_dump::save_tensor(
+        "attention/indexer", "output_topk_idxs", compress_topk_idxs);
   }
 
   // 7) sparse shared-kv attention
@@ -625,6 +692,30 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       << "DSAttention requires precomputed sparse metadata for compress_ratio="
       << compress_ratio_i;
 
+  tensor_dump::save_tensor("attention/sparse_attn_sharedkv", "input_q", q);
+  tensor_dump::save_tensor(
+      "attention/sparse_attn_sharedkv", "input_ori_kv", ori_kv);
+  tensor_dump::save_tensor(
+      "attention/sparse_attn_sharedkv", "input_cmp_kv", cmp_kv);
+  tensor_dump::save_tensor("attention/sparse_attn_sharedkv",
+                           "input_cmp_sparse_indices",
+                           compress_topk_idxs);
+  tensor_dump::save_tensor("attention/sparse_attn_sharedkv",
+                           "input_ori_block_table",
+                           ori_block_table);
+  tensor_dump::save_tensor("attention/sparse_attn_sharedkv",
+                           "input_cmp_block_table",
+                           cmp_block_table);
+  tensor_dump::save_tensor("attention/sparse_attn_sharedkv",
+                           "input_actual_seq_lengths_query",
+                           attn_metadata.actual_seq_lengths_query);
+  tensor_dump::save_tensor("attention/sparse_attn_sharedkv",
+                           "input_actual_seq_lengths_kv",
+                           attn_metadata.actual_seq_lengths_kv);
+  tensor_dump::save_tensor(
+      "attention/sparse_attn_sharedkv", "input_attn_sink", attn_sink_);
+  tensor_dump::save_optional_tensor(
+      "attention/sparse_attn_sharedkv", "input_metadata", sparse_metadata);
   auto [attn_output, output_lse] = xllm::kernel::npu::sparse_attn_sharedkv(
       /*q=*/q,
       /*ori_kv=*/as_optional(ori_kv),
@@ -653,17 +744,29 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       /*layout_q=*/"TND",
       /*layout_kv=*/"PA_ND",
       /*return_softmax_lse=*/false);
+  tensor_dump::save_tensor(
+      "attention/sparse_attn_sharedkv", "output", attn_output);
+  tensor_dump::save_optional_tensor(
+      "attention/sparse_attn_sharedkv", "output_lse", output_lse);
 
   // 8) output RoPE + projection
   auto o = attn_output.view({-1, n_local_heads_, head_dim_});
+  tensor_dump::save_tensor("attention/output_rope", "input", o);
   apply_partial_rope(
       o, nope_head_dim_, rope_head_dim_, cos, sin, /*inverse=*/true);
+  tensor_dump::save_tensor("attention/output_rope", "output", o);
 
   const int64_t num_tokens = o.size(0);
   auto o_group = o.view({num_tokens, n_local_groups_, -1});
   auto wo_a = o_a_proj_->weight().view({n_local_groups_, o_lora_rank_, -1});
+  tensor_dump::save_tensor("attention/o_a_proj", "input", o_group);
+  tensor_dump::save_tensor("attention/o_a_proj", "weight", wo_a);
   auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
+  tensor_dump::save_tensor("attention/o_a_proj", "output", o_low_rank);
+  tensor_dump::save_tensor(
+      "attention/o_b_proj", "input", o_low_rank.reshape({num_tokens, -1}));
   auto output = o_b_proj_->forward(o_low_rank.reshape({num_tokens, -1}));
+  tensor_dump::save_tensor("attention/o_b_proj", "output", output);
   std::optional<torch::Tensor> final_lse = std::nullopt;
   (void)output_lse;
 

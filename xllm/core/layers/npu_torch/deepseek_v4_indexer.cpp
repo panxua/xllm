@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "kernels/ops_api.h"
+#include "util/tensor_dump.h"
 
 namespace xllm {
 namespace layer {
@@ -200,14 +201,24 @@ DeepseekV4IndexerImpl::DeepseekV4IndexerImpl(
 
 torch::Tensor DeepseekV4IndexerImpl::build_query(const torch::Tensor& qr) {
   CHECK(qr.defined()) << "DeepseekV4Indexer::build_query: qr is undefined";
+  tensor_dump::save_tensor("attention/indexer/build_query/wq_b", "input", qr);
   auto q = wq_b_->forward(qr);
   q = q.view({q.size(0), n_heads_, head_dim_});
+  tensor_dump::save_tensor("attention/indexer/build_query/wq_b", "output", q);
   return q;
 }
 
 torch::Tensor DeepseekV4IndexerImpl::build_weights(const torch::Tensor& x) {
   CHECK(x.defined()) << "DeepseekV4Indexer::build_weights: x is undefined";
-  return weights_proj_->forward(x) * indexer_softmax_mul_head_dim_sqrt_;
+  tensor_dump::save_tensor(
+      "attention/indexer/build_weights/weights_proj", "input", x);
+  auto weights = weights_proj_->forward(x);
+  tensor_dump::save_tensor(
+      "attention/indexer/build_weights/weights_proj", "output_raw", weights);
+  weights = weights * indexer_softmax_mul_head_dim_sqrt_;
+  tensor_dump::save_tensor(
+      "attention/indexer/build_weights", "output_scaled", weights);
+  return weights;
 }
 
 torch::Tensor DeepseekV4IndexerImpl::compress_kv(
@@ -243,14 +254,39 @@ torch::Tensor DeepseekV4IndexerImpl::compress_kv(
   auto compressed_sin_view = compressed_sin.value();
   auto compressed_cos_view = compressed_cos.value();
   auto actual_q_lens = actual_seq_lengths_query.value();
+  tensor_dump::save_tensor("attention/indexer/compress_kv", "input_x", x);
+  tensor_dump::save_tensor("attention/indexer/compress_kv",
+                           "input_compressed_sin",
+                           compressed_sin_view);
+  tensor_dump::save_tensor("attention/indexer/compress_kv",
+                           "input_compressed_cos",
+                           compressed_cos_view);
+  tensor_dump::save_tensor("attention/indexer/compress_kv",
+                           "input_actual_seq_lengths_query",
+                           actual_q_lens);
+  tensor_dump::save_tensor("attention/indexer/compress_kv",
+                           "input_kv_state",
+                           std::get<0>(*compressor_states));
+  tensor_dump::save_tensor("attention/indexer/compress_kv",
+                           "input_score_state",
+                           std::get<1>(*compressor_states));
+  tensor_dump::save_tensor("attention/indexer/compress_kv",
+                           "input_kv_block_table",
+                           std::get<0>(*compressor_block_tables));
+  tensor_dump::save_tensor("attention/indexer/compress_kv",
+                           "input_score_block_table",
+                           std::get<1>(*compressor_block_tables));
 
-  return compressor_->forward(dsa_metadata,
-                              hidden_states,
-                              *compressor_states,
-                              *compressor_block_tables,
-                              compressed_sin_view,
-                              compressed_cos_view,
-                              actual_q_lens);
+  auto compressed_kv = compressor_->forward(dsa_metadata,
+                                            hidden_states,
+                                            *compressor_states,
+                                            *compressor_block_tables,
+                                            compressed_sin_view,
+                                            compressed_cos_view,
+                                            actual_q_lens);
+  tensor_dump::save_tensor(
+      "attention/indexer/compress_kv", "output_compressed_kv", compressed_kv);
+  return compressed_kv;
 }
 
 std::tuple<torch::Tensor, torch::Tensor> DeepseekV4IndexerImpl::forward(
@@ -281,6 +317,31 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
       << "DeepseekV4Indexer::select_qli: index_cache is undefined";
 
   (void)with_prefill;
+  tensor_dump::save_tensor("attention/indexer/select_qli", "input_x", x);
+  tensor_dump::save_tensor("attention/indexer/select_qli", "input_qr", qr);
+  tensor_dump::save_tensor(
+      "attention/indexer/select_qli", "input_index_cache", index_cache);
+  if (quant_index_cache != nullptr) {
+    tensor_dump::save_tensor("attention/indexer/select_qli",
+                             "input_quant_index_cache",
+                             *quant_index_cache);
+  }
+  tensor_dump::save_optional_tensor(
+      "attention/indexer/select_qli", "input_cos", cos);
+  tensor_dump::save_optional_tensor(
+      "attention/indexer/select_qli", "input_sin", sin);
+  tensor_dump::save_optional_tensor(
+      "attention/indexer/select_qli", "input_compressed_cos", compressed_cos);
+  tensor_dump::save_optional_tensor(
+      "attention/indexer/select_qli", "input_compressed_sin", compressed_sin);
+  tensor_dump::save_optional_tensor("attention/indexer/select_qli",
+                                    "input_actual_seq_lengths_query",
+                                    actual_seq_lengths_query);
+  tensor_dump::save_optional_tensor("attention/indexer/select_qli",
+                                    "input_actual_seq_lengths_key",
+                                    actual_seq_lengths_key);
+  tensor_dump::save_optional_tensor(
+      "attention/indexer/select_qli", "input_qli_metadata", qli_metadata);
   auto q = build_query(qr);
   if (cos.has_value() && sin.has_value()) {
     const int64_t rope_start_dim =
@@ -288,8 +349,13 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
     q = apply_partial_rope(
         q, rope_start_dim, rope_head_dim_, cos.value(), sin.value());
   }
+  tensor_dump::save_tensor("attention/indexer/select_qli/rope_q", "output", q);
   auto hadamard = get_hadamard_matrix(attn_metadata, hadamard_matrix_);
+  tensor_dump::save_tensor(
+      "attention/indexer/select_qli/hadamard", "matrix", hadamard);
   q = rotate_activation_with_hadamard(q, hadamard, hadamard_scale_);
+  tensor_dump::save_tensor(
+      "attention/indexer/select_qli/hadamard_q", "output", q);
 
   auto kv = compress_kv(x,
                         attn_metadata,
@@ -301,16 +367,28 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
   if (kv.numel() > 0) {
     kv = rotate_activation_with_hadamard(kv, hadamard, hadamard_scale_);
   }
+  tensor_dump::save_tensor(
+      "attention/indexer/select_qli/hadamard_kv", "output", kv);
 
   auto weights = build_weights(x);
   auto [q_quant, q_scale] = dynamic_quant_int8(q);
   q_scale = q_scale.to(torch::kFloat16);
+  tensor_dump::save_tensor(
+      "attention/indexer/select_qli/dynamic_quant_q", "output_quant", q_quant);
+  tensor_dump::save_tensor(
+      "attention/indexer/select_qli/dynamic_quant_q", "output_scale", q_scale);
   torch::Tensor kv_quant;
   torch::Tensor kv_scale;
   if (kv.numel() > 0) {
     std::tie(kv_quant, kv_scale) = dynamic_quant_int8(kv);
     kv_scale = kv_scale.unsqueeze(-1);
     kv_scale = kv_scale.to(torch::kFloat16);
+    tensor_dump::save_tensor("attention/indexer/select_qli/dynamic_quant_kv",
+                             "output_quant",
+                             kv_quant);
+    tensor_dump::save_tensor("attention/indexer/select_qli/dynamic_quant_kv",
+                             "output_scale",
+                             kv_scale);
   }
 
   if (kv.numel() > 0) {
@@ -321,6 +399,17 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
       auto quant_cache_flat = quant_index_cache->view({-1, kv_scale.size(-1)});
       quant_cache_flat.index_copy_(
           0, slots, kv_scale.view({-1, kv_scale.size(-1)}));
+    }
+    tensor_dump::save_tensor(
+        "attention/indexer/select_qli/index_cache_update", "slots", slots);
+    tensor_dump::save_tensor("attention/indexer/select_qli/index_cache_update",
+                             "output_index_cache",
+                             index_cache);
+    if (quant_index_cache != nullptr) {
+      tensor_dump::save_tensor(
+          "attention/indexer/select_qli/index_cache_update",
+          "output_quant_index_cache",
+          *quant_index_cache);
     }
   }
 
@@ -395,9 +484,39 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
   qli_params.cmp_ratio = compress_ratio_;
   qli_params.return_value = false;
 
+  tensor_dump::save_tensor(
+      "attention/indexer/quant_lightning_indexer", "input_query", q_quant);
+  tensor_dump::save_tensor(
+      "attention/indexer/quant_lightning_indexer", "input_key", index_cache);
+  tensor_dump::save_tensor("attention/indexer/quant_lightning_indexer",
+                           "input_weights",
+                           weights.to(torch::kFloat16));
+  tensor_dump::save_tensor("attention/indexer/quant_lightning_indexer",
+                           "input_query_dequant_scale",
+                           q_scale);
+  tensor_dump::save_tensor("attention/indexer/quant_lightning_indexer",
+                           "input_key_dequant_scale",
+                           key_dequant_scale);
+  tensor_dump::save_tensor("attention/indexer/quant_lightning_indexer",
+                           "input_actual_seq_lengths_query",
+                           query_seq_lens);
+  tensor_dump::save_tensor("attention/indexer/quant_lightning_indexer",
+                           "input_actual_seq_lengths_key",
+                           key_seq_lens);
+  tensor_dump::save_tensor("attention/indexer/quant_lightning_indexer",
+                           "input_block_table",
+                           attn_metadata.block_table);
+  tensor_dump::save_optional_tensor("attention/indexer/quant_lightning_indexer",
+                                    "input_metadata",
+                                    metadata_opt);
   auto [topk_indices, sparse_values] =
       xllm::kernel::quant_lightning_indexer(qli_params);
-  (void)sparse_values;
+  tensor_dump::save_tensor("attention/indexer/quant_lightning_indexer",
+                           "output_topk_indices",
+                           topk_indices);
+  tensor_dump::save_tensor("attention/indexer/quant_lightning_indexer",
+                           "output_sparse_values",
+                           sparse_values);
 
   (void)key_seq_lens;
   return topk_indices;

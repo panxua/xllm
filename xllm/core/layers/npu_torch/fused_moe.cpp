@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
+#include "util/tensor_dump.h"
 
 namespace xllm {
 namespace layer {
@@ -452,6 +453,10 @@ torch::Tensor FusedMoEImpl::select_experts(
         << "preselected topk_ids token count mismatch, expected "
         << hidden_states_2d.size(0) << ", got " << topk_ids.size(0);
     topk_weights = topk_weights.to(hidden_states_2d.dtype());
+    tensor_dump::save_tensor(
+        "ffn/select_experts", "input_preselected_topk_weights", topk_weights);
+    tensor_dump::save_tensor(
+        "ffn/select_experts", "input_preselected_topk_ids", topk_ids);
   } else {
     // prepare the parameters for select_experts
     xllm::kernel::MoeFusedTopkParams moe_active_topk_params;
@@ -464,9 +469,15 @@ torch::Tensor FusedMoEImpl::select_experts(
     moe_active_topk_params.scoring_func = scoring_func_;
     // moe_active_topk_params.route_scale = route_scale_;
     // moe_active_topk_params.e_score_correction_bias = e_score_correction_bias;
+    tensor_dump::save_tensor(
+        "ffn/moe_active_topk", "input_router_logits", router_logits_2d);
     std::tie(topk_weights, topk_ids) =
         xllm::kernel::moe_active_topk(moe_active_topk_params);
     topk_ids = topk_ids.to(torch::kInt32);
+    tensor_dump::save_tensor(
+        "ffn/moe_active_topk", "output_topk_weights", topk_weights);
+    tensor_dump::save_tensor(
+        "ffn/moe_active_topk", "output_topk_ids", topk_ids);
   }
 
   xllm::kernel::MoeInitRoutingV2Params moe_init_routing_params;
@@ -487,9 +498,21 @@ torch::Tensor FusedMoEImpl::select_experts(
   moe_init_routing_params.quant_mode = -1;
   // TODO: NPU moe_init_routing_v2 is equivalent to moe_gen_idx +
   // moe_expand_input (and the token_count/cusum outputs) on other backends.
+  tensor_dump::save_tensor(
+      "ffn/moe_init_routing_v2", "input_x", hidden_states_2d);
+  tensor_dump::save_tensor(
+      "ffn/moe_init_routing_v2", "input_expert_idx", topk_ids);
   auto [expand_hidden_states, expand_row_ids, group_list, dynamic_scale] =
       xllm::kernel::moe_init_routing_v2(moe_init_routing_params);
-  (void)dynamic_scale;
+  tensor_dump::save_tensor("ffn/moe_init_routing_v2",
+                           "output_expand_hidden_states",
+                           expand_hidden_states);
+  tensor_dump::save_tensor(
+      "ffn/moe_init_routing_v2", "output_expand_row_ids", expand_row_ids);
+  tensor_dump::save_tensor(
+      "ffn/moe_init_routing_v2", "output_group_list", group_list);
+  tensor_dump::save_tensor(
+      "ffn/moe_init_routing_v2", "output_dynamic_scale", dynamic_scale);
 
   // collect the selected tensor
   selected_expert_info.reduce_weight = topk_weights;
@@ -510,11 +533,33 @@ torch::Tensor FusedMoEImpl::forward_expert(
       hidden_states.reshape({-1, hidden_states.size(-1)});
   torch::Tensor router_logits_2d =
       router_logits.reshape({-1, router_logits.size(-1)});
+  tensor_dump::save_tensor(
+      "ffn/forward_expert", "input_hidden_states", hidden_states);
+  tensor_dump::save_tensor(
+      "ffn/forward_expert", "input_hidden_states_2d", hidden_states_2d);
+  tensor_dump::save_tensor(
+      "ffn/forward_expert", "input_router_logits", router_logits);
+  tensor_dump::save_tensor(
+      "ffn/forward_expert", "input_router_logits_2d", router_logits_2d);
+  tensor_dump::save_optional_tensor(
+      "ffn/forward_expert", "input_shared_output", shared_output);
 
   // Step 1-3: select experts
   SelectedExpertInfo selected_expert_info;
   torch::Tensor expand_hidden_states =
       select_experts(hidden_states_2d, router_logits_2d, selected_expert_info);
+  tensor_dump::save_tensor("ffn/select_experts",
+                           "output_expand_hidden_states",
+                           expand_hidden_states);
+  tensor_dump::save_tensor("ffn/select_experts",
+                           "output_reduce_weight",
+                           selected_expert_info.reduce_weight);
+  tensor_dump::save_tensor("ffn/select_experts",
+                           "output_combine_idx",
+                           selected_expert_info.combine_idx);
+  tensor_dump::save_tensor("ffn/select_experts",
+                           "output_token_count_slice",
+                           selected_expert_info.token_count_slice);
 
   torch::Tensor gemm1_out;
   torch::Tensor gemm2_out;
@@ -529,10 +574,17 @@ torch::Tensor FusedMoEImpl::forward_expert(
     quant_params.input = expand_hidden_states;
     torch::Tensor quantized_expand_hidden_states;
     std::optional<torch::Tensor> pertoken_scale;
+    tensor_dump::save_tensor(
+        "ffn/dynamic_quant", "input", expand_hidden_states);
     std::tie(quantized_expand_hidden_states, pertoken_scale) =
         xllm::kernel::dynamic_quant(quant_params);
     CHECK(pertoken_scale.has_value() && pertoken_scale->defined())
         << "dynamic_quant must return per-token scale for W8A8 fused MoE.";
+    tensor_dump::save_tensor("ffn/dynamic_quant",
+                             "output_quantized",
+                             quantized_expand_hidden_states);
+    tensor_dump::save_optional_tensor(
+        "ffn/dynamic_quant", "output_scale", pertoken_scale);
 
     // Step 5: first grouped matmul (int32 output expected for dequant+swiglu).
     if (w13_.size(1) != quantized_expand_hidden_states.size(1)) {
@@ -550,7 +602,14 @@ torch::Tensor FusedMoEImpl::forward_expert(
       group_gemm_params.group_type = 0;
       group_gemm_params.group_list_type = 1;
       group_gemm_params.output_dtype = torch::kInt32;
+      tensor_dump::save_tensor(
+          "ffn/group_gemm1", "input_x", quantized_expand_hidden_states);
+      tensor_dump::save_tensor("ffn/group_gemm1", "input_weight", w13_);
+      tensor_dump::save_tensor("ffn/group_gemm1",
+                               "input_group_list",
+                               selected_expert_info.token_count_slice);
       gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
+      tensor_dump::save_tensor("ffn/group_gemm1", "output", gemm1_out);
     }
 
     // Step 6: fused dequant + swiglu + quant.
@@ -564,8 +623,22 @@ torch::Tensor FusedMoEImpl::forward_expert(
       params.group_index = selected_expert_info.token_count_slice;
       params.activate_left = true;
       params.quant_mode = 1;
+      tensor_dump::save_tensor(
+          "ffn/dequant_swiglu_quant", "input_x", gemm1_out);
+      tensor_dump::save_tensor(
+          "ffn/dequant_swiglu_quant", "input_weight_scale", w13_scale_);
+      tensor_dump::save_tensor("ffn/dequant_swiglu_quant",
+                               "input_activation_scale",
+                               pertoken_scale.value());
+      tensor_dump::save_tensor("ffn/dequant_swiglu_quant",
+                               "input_group_index",
+                               selected_expert_info.token_count_slice);
       std::tie(act_quantized, act_scale) =
           xllm::kernel::dequant_swiglu_quant(params);
+      tensor_dump::save_tensor(
+          "ffn/dequant_swiglu_quant", "output_act_quantized", act_quantized);
+      tensor_dump::save_tensor(
+          "ffn/dequant_swiglu_quant", "output_act_scale", act_scale);
     }
 
     // Step 7: second grouped matmul (dequant to hidden dtype).
@@ -588,7 +661,16 @@ torch::Tensor FusedMoEImpl::forward_expert(
       group_gemm_params.group_type = 0;
       group_gemm_params.group_list_type = 1;
       group_gemm_params.output_dtype = hidden_states_dtype;
+      tensor_dump::save_tensor("ffn/group_gemm2", "input_x", act_quantized);
+      tensor_dump::save_tensor("ffn/group_gemm2", "input_weight", w2_);
+      tensor_dump::save_tensor("ffn/group_gemm2", "input_scale", w2_scale_);
+      tensor_dump::save_tensor(
+          "ffn/group_gemm2", "input_per_token_scale", act_scale);
+      tensor_dump::save_tensor("ffn/group_gemm2",
+                               "input_group_list",
+                               selected_expert_info.token_count_slice);
       gemm2_out = xllm::kernel::group_gemm(group_gemm_params);
+      tensor_dump::save_tensor("ffn/group_gemm2", "output", gemm2_out);
     }
   } else {
     // Step 4: group gemm 1
@@ -604,7 +686,13 @@ torch::Tensor FusedMoEImpl::forward_expert(
       group_gemm_params.split_item = 2;
       group_gemm_params.group_type = 0;
       group_gemm_params.group_list_type = 1;
+      tensor_dump::save_tensor(
+          "ffn/group_gemm1", "input_x", expand_hidden_states);
+      tensor_dump::save_tensor("ffn/group_gemm1", "input_weight", w13_);
+      tensor_dump::save_optional_tensor(
+          "ffn/group_gemm1", "input_group_list", group_gemm_params.group_list);
       gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
+      tensor_dump::save_tensor("ffn/group_gemm1", "output", gemm1_out);
     }
 
     // Step 5: activation
@@ -615,8 +703,10 @@ torch::Tensor FusedMoEImpl::forward_expert(
     activation_params.output = act_out;
     activation_params.act_mode = hidden_act_;
     activation_params.is_gated = is_gated_;
+    tensor_dump::save_tensor("ffn/activation", "input", gemm1_out);
     xllm::kernel::active(activation_params);
     act_out = activation_params.output;
+    tensor_dump::save_tensor("ffn/activation", "output", act_out);
 
     // Step 6: group gemm 2
     {
@@ -631,7 +721,12 @@ torch::Tensor FusedMoEImpl::forward_expert(
       group_gemm_params.split_item = 2;
       group_gemm_params.group_type = 0;
       group_gemm_params.group_list_type = 1;
+      tensor_dump::save_tensor("ffn/group_gemm2", "input_x", act_out);
+      tensor_dump::save_tensor("ffn/group_gemm2", "input_weight", w2_);
+      tensor_dump::save_optional_tensor(
+          "ffn/group_gemm2", "input_group_list", group_gemm_params.group_list);
       gemm2_out = xllm::kernel::group_gemm(group_gemm_params);
+      tensor_dump::save_tensor("ffn/group_gemm2", "output", gemm2_out);
     }
   }
 
@@ -641,19 +736,40 @@ torch::Tensor FusedMoEImpl::forward_expert(
   moe_combine_params.input = gemm2_out;
   moe_combine_params.reduce_weight = selected_expert_info.reduce_weight;
   moe_combine_params.gather_ids = selected_expert_info.combine_idx;
+  tensor_dump::save_tensor("ffn/moe_combine_result", "input", gemm2_out);
+  tensor_dump::save_tensor("ffn/moe_combine_result",
+                           "input_reduce_weight",
+                           selected_expert_info.reduce_weight);
+  tensor_dump::save_tensor("ffn/moe_combine_result",
+                           "input_gather_ids",
+                           selected_expert_info.combine_idx);
   final_hidden_states = xllm::kernel::moe_combine_result(moe_combine_params);
+  tensor_dump::save_tensor(
+      "ffn/moe_combine_result", "output", final_hidden_states);
   if (shared_output.has_value()) {
+    tensor_dump::save_tensor(
+        "ffn/shared_output_add", "input_moe", final_hidden_states);
+    tensor_dump::save_tensor(
+        "ffn/shared_output_add", "input_shared", shared_output.value());
     final_hidden_states = final_hidden_states + shared_output.value();
+    tensor_dump::save_tensor(
+        "ffn/shared_output_add", "output", final_hidden_states);
   }
   // reshape the final hidden states to the original shape
   final_hidden_states = final_hidden_states.reshape(hidden_states_shape);
+  tensor_dump::save_tensor(
+      "ffn/forward_expert", "output_reshaped", final_hidden_states);
 
   if (tp_pg_->world_size() > 1) {
+    tensor_dump::save_tensor("ffn/tp_reduce", "input", final_hidden_states);
     final_hidden_states = parallel_state::reduce(final_hidden_states, tp_pg_);
+    tensor_dump::save_tensor("ffn/tp_reduce", "output", final_hidden_states);
   }
   if (parallel_args_.ep_size() > 1) {
+    tensor_dump::save_tensor("ffn/ep_reduce", "input", final_hidden_states);
     final_hidden_states = parallel_state::reduce(final_hidden_states,
                                                  parallel_args_.moe_ep_group_);
+    tensor_dump::save_tensor("ffn/ep_reduce", "output", final_hidden_states);
   }
   return final_hidden_states;
 }
@@ -662,25 +778,39 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
                                     const ModelInputParams& input_params) {
   auto input = hidden_states;
   bool need_slice = false;
+  tensor_dump::save_tensor("ffn/forward", "input_hidden_states", hidden_states);
   if (parallel_args_.dp_size() > 1 && parallel_args_.ep_size() > 1) {
+    tensor_dump::save_tensor("ffn/dp_gather", "input", input);
     input = parallel_state::gather(input,
                                    parallel_args_.dp_local_process_group_,
                                    input_params.dp_global_token_nums);
+    tensor_dump::save_tensor("ffn/dp_gather", "output", input);
     need_slice = true;
   }
 
   std::optional<torch::Tensor> shared_output = std::nullopt;
   if (n_shared_experts_ > 0) {
+    tensor_dump::save_tensor("ffn/shared_experts", "input", input);
     shared_output = shared_experts_(input);
+    tensor_dump::save_optional_tensor(
+        "ffn/shared_experts", "output_raw", shared_output);
     if (shared_expert_gate_) {
+      tensor_dump::save_tensor("ffn/shared_expert_gate", "input", input);
       auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
+      tensor_dump::save_tensor(
+          "ffn/shared_expert_gate", "output_sigmoid", gate);
       if (shared_output.has_value()) {
         torch::Tensor res = gate * shared_output.value();
         shared_output = res;
+        tensor_dump::save_tensor(
+            "ffn/shared_experts", "output_gated", shared_output.value());
       }
     }
   }
+  tensor_dump::save_tensor("ffn/gate_proj", "input", input);
   auto router_logits = gate_(input);
+  tensor_dump::save_tensor(
+      "ffn/gate_proj", "output_router_logits", router_logits);
   auto output = forward_expert(input, router_logits, shared_output);
 
   if (need_slice) {
@@ -689,8 +819,11 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
     auto start =
         std::accumulate(dp_tokens.begin(), dp_tokens.begin() + dp_rank, 0);
     auto end = start + dp_tokens[dp_rank];
+    tensor_dump::save_tensor("ffn/dp_slice", "input", output);
     output = output.slice(0, start, end);
+    tensor_dump::save_tensor("ffn/dp_slice", "output", output);
   }
+  tensor_dump::save_tensor("ffn/forward", "output", output);
   return output;
 }
 
@@ -703,18 +836,31 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
   auto selected_topk_weights = topk_weights;
   auto selected_topk_ids = topk_ids;
   bool need_slice = false;
+  tensor_dump::save_tensor("ffn/forward_with_selected_experts",
+                           "input_hidden_states",
+                           hidden_states);
+  tensor_dump::save_tensor(
+      "ffn/forward_with_selected_experts", "input_topk_weights", topk_weights);
+  tensor_dump::save_tensor(
+      "ffn/forward_with_selected_experts", "input_topk_ids", topk_ids);
   if (parallel_args_.dp_size() > 1 && parallel_args_.ep_size() > 1) {
+    tensor_dump::save_tensor("ffn/dp_gather", "input_hidden_states", input);
     input = parallel_state::gather(input,
                                    parallel_args_.dp_local_process_group_,
                                    input_params.dp_global_token_nums);
+    tensor_dump::save_tensor("ffn/dp_gather", "output_hidden_states", input);
     selected_topk_weights =
         parallel_state::gather(selected_topk_weights,
                                parallel_args_.dp_local_process_group_,
                                input_params.dp_global_token_nums);
+    tensor_dump::save_tensor(
+        "ffn/dp_gather", "output_topk_weights", selected_topk_weights);
     selected_topk_ids =
         parallel_state::gather(selected_topk_ids,
                                parallel_args_.dp_local_process_group_,
                                input_params.dp_global_token_nums);
+    tensor_dump::save_tensor(
+        "ffn/dp_gather", "output_topk_ids", selected_topk_ids);
     need_slice = true;
   }
 
@@ -730,15 +876,29 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
 
   preselected_experts_ =
       std::make_pair(weights_2d.to(input.dtype()), ids_2d.to(torch::kInt32));
+  tensor_dump::save_tensor("ffn/forward_with_selected_experts",
+                           "preselected_topk_weights",
+                           preselected_experts_->first);
+  tensor_dump::save_tensor("ffn/forward_with_selected_experts",
+                           "preselected_topk_ids",
+                           preselected_experts_->second);
 
   std::optional<torch::Tensor> shared_output = std::nullopt;
   if (n_shared_experts_ > 0) {
+    tensor_dump::save_tensor("ffn/shared_experts", "input", input);
     shared_output = shared_experts_(input);
+    tensor_dump::save_optional_tensor(
+        "ffn/shared_experts", "output_raw", shared_output);
     if (shared_expert_gate_) {
+      tensor_dump::save_tensor("ffn/shared_expert_gate", "input", input);
       auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
+      tensor_dump::save_tensor(
+          "ffn/shared_expert_gate", "output_sigmoid", gate);
       if (shared_output.has_value()) {
         torch::Tensor res = gate * shared_output.value();
         shared_output = res;
+        tensor_dump::save_tensor(
+            "ffn/shared_experts", "output_gated", shared_output.value());
       }
     }
   }
@@ -746,6 +906,9 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
   auto router_shape = input.sizes().vec();
   router_shape.back() = num_total_experts_;
   auto router_logits = torch::empty(router_shape, input.options());
+  tensor_dump::save_tensor("ffn/forward_with_selected_experts",
+                           "placeholder_router_logits",
+                           router_logits);
   auto output = forward_expert(input, router_logits, shared_output);
   preselected_experts_ = std::nullopt;
 
@@ -755,8 +918,12 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
     auto start =
         std::accumulate(dp_tokens.begin(), dp_tokens.begin() + dp_rank, 0);
     auto end = start + dp_tokens[dp_rank];
+    tensor_dump::save_tensor("ffn/dp_slice", "input", output);
     output = output.slice(0, start, end);
+    tensor_dump::save_tensor("ffn/dp_slice", "output", output);
   }
+  tensor_dump::save_tensor(
+      "ffn/forward_with_selected_experts", "output", output);
   return output;
 }
 

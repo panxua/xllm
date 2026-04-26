@@ -26,6 +26,7 @@ limitations under the License.
 #endif
 
 #include "kernels/ops_api.h"
+#include "util/tensor_dump.h"
 
 namespace xllm {
 namespace layer {
@@ -135,7 +136,10 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
       << "DeepseekV4Gate::forward hidden_states last dim mismatch, expected "
       << hidden_size_ << " got " << hidden_states.size(-1);
 
+  tensor_dump::save_tensor("gate/matmul", "input_hidden_states", hidden_states);
+  tensor_dump::save_tensor("gate/matmul", "input_weight", weight_);
   auto logits = torch::matmul(hidden_states, weight_.transpose(0, 1));
+  tensor_dump::save_tensor("gate/matmul", "output_logits", logits);
 
   constexpr bool renormalize = true;
   const int64_t norm_type = score_func_to_norm_type(score_func_);
@@ -143,7 +147,18 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
       check_npu_moe_gating_top_k(hidden_states, topk_, renormalize, norm_type);
 
   if (!is_support_npu_moe_gating_top_k) {
-    return select_experts_native(logits, input_ids);
+    tensor_dump::save_tensor(
+        "gate/select_experts_native", "input_logits", logits);
+    tensor_dump::save_optional_tensor(
+        "gate/select_experts_native", "input_ids", input_ids);
+    auto [native_topk_weights, native_topk_idx] =
+        select_experts_native(logits, input_ids);
+    tensor_dump::save_tensor("gate/select_experts_native",
+                             "output_topk_weights",
+                             native_topk_weights);
+    tensor_dump::save_tensor(
+        "gate/select_experts_native", "output_topk_ids", native_topk_idx);
+    return std::make_tuple(native_topk_weights, native_topk_idx);
   }
 
   kernel::MoeGatingTopKHashParams gate_params;
@@ -176,18 +191,42 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
       gate_params.bias = c10::nullopt;
     }
   }
+  tensor_dump::save_tensor(
+      "gate/moe_gating_top_k_hash", "input_logits", logits);
+  tensor_dump::save_optional_tensor(
+      "gate/moe_gating_top_k_hash", "input_ids", gate_params.input_ids);
+  tensor_dump::save_optional_tensor(
+      "gate/moe_gating_top_k_hash", "tid2eid", gate_params.tid2eid);
+  tensor_dump::save_optional_tensor(
+      "gate/moe_gating_top_k_hash", "bias", gate_params.bias);
   auto [topk_weights, topk_idx, score_out] =
       kernel::moe_gating_top_k_hash(gate_params);
-  (void)score_out;
+  tensor_dump::save_tensor(
+      "gate/moe_gating_top_k_hash", "output_topk_weights_raw", topk_weights);
+  tensor_dump::save_tensor(
+      "gate/moe_gating_top_k_hash", "output_topk_ids_raw", topk_idx);
+  tensor_dump::save_tensor(
+      "gate/moe_gating_top_k_hash", "output_score", score_out);
 
   if (gate_params.norm_type == 0 && renormalize) {
+    tensor_dump::save_tensor(
+        "gate/renormalize_topk_weights", "input", topk_weights);
     topk_weights = renormalize_topk_weights(topk_weights);
+    tensor_dump::save_tensor(
+        "gate/renormalize_topk_weights", "output", topk_weights);
   }
 
   if (gate_params.norm_type == 2) {
+    tensor_dump::save_tensor(
+        "gate/renormalize_topk_weights_sqrtsoftplus", "input", topk_weights);
     topk_weights = renormalize_topk_weights(topk_weights);
+    tensor_dump::save_tensor(
+        "gate/renormalize_topk_weights_sqrtsoftplus", "output", topk_weights);
   }
 
+  tensor_dump::save_tensor("gate", "output_topk_weights_final", topk_weights);
+  tensor_dump::save_tensor(
+      "gate", "output_topk_ids_final", topk_idx.to(torch::kInt32));
   return std::make_tuple(topk_weights, topk_idx.to(torch::kInt32));
 }
 
@@ -204,16 +243,23 @@ DeepseekV4GateImpl::select_experts_native(
   } else {
     scores = torch::softplus(router_logits).sqrt();
   }
+  tensor_dump::save_tensor("gate/select_experts_native", "scores", scores);
 
   auto original_scores = scores;
   if (!hash_layer_ && bias_.defined()) {
+    tensor_dump::save_tensor("gate/select_experts_native", "bias", bias_);
     scores = scores + bias_.to(scores.dtype());
+    tensor_dump::save_tensor(
+        "gate/select_experts_native", "biased_scores", scores);
   }
 
   torch::Tensor topk_idx;
   if (hash_layer_ && input_ids.has_value() && input_ids.value().defined() &&
       tid2eid_.defined()) {
     auto lookup_ids = input_ids.value().to(torch::kLong);
+    tensor_dump::save_tensor(
+        "gate/select_experts_native", "lookup_ids", lookup_ids);
+    tensor_dump::save_tensor("gate/select_experts_native", "tid2eid", tid2eid_);
     topk_idx = tid2eid_.index({lookup_ids});
   } else {
     topk_idx = std::get<1>(torch::topk(scores,
@@ -225,10 +271,16 @@ DeepseekV4GateImpl::select_experts_native(
 
   auto gather_idx = topk_idx.to(torch::kLong);
   auto topk_weights = original_scores.gather(-1, gather_idx);
+  tensor_dump::save_tensor(
+      "gate/select_experts_native", "topk_weights_before_norm", topk_weights);
   auto denom = topk_weights.sum(-1, true);
   denom = torch::clamp_min(denom, 1e-20);
   topk_weights = topk_weights / denom;
   topk_weights = topk_weights * route_scale_;
+  tensor_dump::save_tensor(
+      "gate/select_experts_native", "topk_weights", topk_weights);
+  tensor_dump::save_tensor(
+      "gate/select_experts_native", "topk_ids", gather_idx.to(torch::kInt32));
 
   return std::make_tuple(topk_weights, gather_idx.to(torch::kInt32));
 }

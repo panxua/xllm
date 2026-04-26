@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/deepseek_v4_decoder_layer.h"
+#include "core/util/tensor_dump.h"
 #include "layers/npu/deepseek_v4_rotary_embedding.h"
 #include "llm_model_base.h"
 
@@ -304,6 +305,8 @@ class DeepseekV4ModelImpl
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) override {
     torch::NoGradGuard no_grad;
+    const int64_t dump_step = forward_step_.fetch_add(1);
+    tensor_dump::ScopedStep dump_step_scope(dump_step);
     if (tokens.numel() == 0) {
       tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
       positions = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
@@ -758,6 +761,7 @@ class DeepseekV4ModelImpl
   std::vector<std::vector<DSACacheInfo>> caches_info_;
   // group_infos_[group_id] = DSAGroupInfo
   std::vector<DSAGroupInfo> group_infos_;
+  std::atomic<int64_t> forward_step_{0};
 
   DEFINE_WEIGHT(hc_head_fn);
   DEFINE_WEIGHT(hc_head_base);

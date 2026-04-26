@@ -43,6 +43,24 @@ class DeepseekV4GateImpl : public torch::nn::Module {
   void load_state_dict(const StateDict& state_dict);
 
   bool is_hash_layer() const { return hash_layer_; }
+  const torch::Tensor& debug_last_router_logits() const {
+    return debug_last_router_logits_;
+  }
+  const torch::Tensor& debug_last_router_logits_before_hash_gating() const {
+    return debug_last_router_logits_before_hash_gating_;
+  }
+  const torch::Tensor& debug_last_input_ids_after_comm() const {
+    return debug_last_input_ids_after_comm_;
+  }
+  const torch::Tensor& debug_last_hash_topk_weights() const {
+    return debug_last_hash_topk_weights_;
+  }
+  const torch::Tensor& debug_last_hash_topk_ids() const {
+    return debug_last_hash_topk_ids_;
+  }
+  const torch::Tensor& debug_weight() const { return weight_; }
+  const torch::Tensor& debug_tid2eid() const { return tid2eid_; }
+  const torch::Tensor& debug_e_score_correction_bias() const { return bias_; }
 
  private:
   std::tuple<torch::Tensor, torch::Tensor> select_experts_native(
@@ -58,10 +76,16 @@ class DeepseekV4GateImpl : public torch::nn::Module {
   double route_scale_ = 1.0;
   std::string score_func_ = "softmax";
   bool hash_layer_ = false;
+  int32_t layer_id_ = -1;
 
   torch::Tensor weight_;
   torch::Tensor tid2eid_;
   torch::Tensor bias_;
+  torch::Tensor debug_last_router_logits_;
+  torch::Tensor debug_last_router_logits_before_hash_gating_;
+  torch::Tensor debug_last_input_ids_after_comm_;
+  torch::Tensor debug_last_hash_topk_weights_;
+  torch::Tensor debug_last_hash_topk_ids_;
 };
 
 TORCH_MODULE(DeepseekV4Gate);

@@ -26,6 +26,7 @@ limitations under the License.
 #include <string>
 
 #include "kernels/ops_api.h"
+#include "layers/npu_torch/moe_dump_utils.h"
 #include "xllm/core/util/tensor_helper.h"
 
 namespace xllm {
@@ -188,6 +189,7 @@ DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
       "ffn_norm", RMSNorm(hidden_size, args.rms_norm_eps(), options));
   FusedMoEArgs moe_args;
   moe_args.is_gated = true;
+  moe_args.debug_layer_id = layer_id;
   // DeepseekV4 drives expert routing through its own DeepseekV4Gate and only
   // calls forward_with_selected_experts().  The FusedMoE internal gate_ is
   // therefore never used; skip loading its weights to avoid redundant memory
@@ -333,6 +335,11 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
           layer_dump_dir, "deepseek_v4_decoder_layer.cpp", "moe", node, tensor);
     }
   };
+  const auto dump_vllm_tensor = [&](const std::string& node,
+                                    const torch::Tensor& tensor) {
+    moe_dump::dump_tensor(
+        moe_dump::current_step(), tp_rank_, layer_id_, node, tensor);
+  };
 
   CHECK(attn_metadata.dsa_metadata)
       << "DeepseekV4DecoderLayer requires DSA metadata for DSAttention path.";
@@ -366,6 +373,8 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   auto [ffn_input, post_ffn, comb_ffn] =
       hc_pre(x, hc_ffn_fn_, hc_ffn_scale_, hc_ffn_base_);
   ffn_input = std::get<0>(ffn_norm_->forward(ffn_input));
+  dump_vllm_tensor("moe_input_hidden_states",
+                   ffn_input.reshape({-1, ffn_input.size(-1)}));
 
   auto ffn_input_2d = ffn_input.reshape({-1, ffn_input.size(-1)});
   log_moe_tensor("ffn_input_2d.input", ffn_input_2d);
@@ -388,6 +397,7 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   if (gate_input_ids.has_value()) {
     log_moe_tensor("gate_input_ids.input", gate_input_ids.value());
     dump_moe_tensor("gate_input_ids.input", gate_input_ids.value());
+    dump_vllm_tensor("gate_input_ids_after_comm", gate_input_ids.value());
   } else {
     log_moe_tensor("gate_input_ids.input", torch::Tensor());
   }
@@ -396,6 +406,18 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
         << "DeepseekV4 hash gate requires input_ids for routing";
   }
   auto [topk_weights, topk_ids] = gate_->forward(ffn_input_2d, gate_input_ids);
+  dump_vllm_tensor("gate_router_logits", gate_->debug_last_router_logits());
+  dump_vllm_tensor("gate_router_logits_before_hash_gating",
+                   gate_->debug_last_router_logits_before_hash_gating());
+  dump_vllm_tensor("gate_hash_topk_weights",
+                   gate_->debug_last_hash_topk_weights());
+  dump_vllm_tensor("gate_hash_topk_ids", gate_->debug_last_hash_topk_ids());
+  dump_vllm_tensor("gate_weight", gate_->debug_weight());
+  dump_vllm_tensor("gate_e_score_correction_bias",
+                   gate_->debug_e_score_correction_bias());
+  dump_vllm_tensor("gate_tid2eid", gate_->debug_tid2eid());
+  dump_vllm_tensor("gate_hash_topk_weights", topk_weights);
+  dump_vllm_tensor("gate_hash_topk_ids", topk_ids);
   log_moe_tensor("topk_weights.output", topk_weights);
   log_moe_tensor("topk_ids.output", topk_ids);
   dump_moe_tensor("topk_weights.output", topk_weights);
@@ -405,6 +427,8 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   const auto& shared_output_pre = moe_mlp_->debug_last_shared_output_pre();
   const auto& shared_gate = moe_mlp_->debug_last_shared_gate();
   const auto& shared_output = moe_mlp_->debug_last_shared_output();
+  dump_vllm_tensor("shared_experts_output", shared_output);
+  dump_vllm_tensor("shared_fused_moe_shared_expert_out", shared_output);
   log_moe_tensor("shared_output_pre.output", shared_output_pre);
   log_moe_tensor("shared_gate.output", shared_gate);
   log_moe_tensor("shared_output.output", shared_output);
@@ -413,6 +437,16 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   dump_moe_tensor("shared_output.output", shared_output);
   log_moe_tensor("moe_output.output", ffn_input);
   dump_moe_tensor("moe_output.output", ffn_input);
+  dump_vllm_tensor("routed_experts_output",
+                   moe_mlp_->debug_last_routed_experts_output());
+  dump_vllm_tensor("shared_fused_moe_routed_out",
+                   moe_mlp_->debug_last_routed_experts_output());
+  dump_vllm_tensor("shared_fused_moe_input_hidden_states",
+                   moe_mlp_->debug_last_input_hidden_states());
+  dump_vllm_tensor("shared_fused_moe_router_logits",
+                   gate_->debug_last_router_logits());
+  dump_vllm_tensor("moe_final_output_before_allreduce",
+                   moe_mlp_->debug_last_before_allreduce());
   x = hc_post(ffn_input, residual_ffn, post_ffn, comb_ffn);
 
   return x;

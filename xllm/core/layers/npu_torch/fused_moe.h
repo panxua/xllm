@@ -57,6 +57,17 @@ class FusedMoEImpl : public torch::nn::Module {
   const torch::Tensor& debug_last_shared_output_pre() const;
   const torch::Tensor& debug_last_shared_gate() const;
   const torch::Tensor& debug_last_shared_output() const;
+  const torch::Tensor& debug_last_before_allreduce() const;
+  const torch::Tensor& debug_last_router_logits_input() const;
+  const torch::Tensor& debug_last_input_hidden_states() const;
+  const torch::Tensor& debug_last_topk_ids() const;
+  const torch::Tensor& debug_last_topk_weights() const;
+  const torch::Tensor& debug_last_fused_experts_output() const;
+  const torch::Tensor& debug_last_routed_experts_output() const;
+  const torch::Tensor& debug_w13_weight() const { return w13_; }
+  const torch::Tensor& debug_w2_weight() const { return w2_; }
+  const torch::Tensor& debug_w13_weight_scale() const { return w13_scale_; }
+  const torch::Tensor& debug_w2_weight_scale() const { return w2_scale_; }
 
  private:
   // struct to store the selected expert info
@@ -94,6 +105,14 @@ class FusedMoEImpl : public torch::nn::Module {
   torch::Tensor debug_last_shared_output_pre_;
   torch::Tensor debug_last_shared_gate_;
   torch::Tensor debug_last_shared_output_;
+  torch::Tensor debug_last_before_allreduce_;
+  torch::Tensor debug_last_router_logits_input_;
+  torch::Tensor debug_last_input_hidden_states_;
+  torch::Tensor debug_last_topk_ids_;
+  torch::Tensor debug_last_topk_weights_;
+  torch::Tensor debug_last_fused_experts_output_;
+  torch::Tensor debug_last_routed_experts_output_;
+  int32_t debug_layer_id_ = -1;
 
   int64_t num_experts_per_rank_;
   int64_t start_expert_id_;

@@ -80,6 +80,7 @@ DeepseekV4GateImpl::DeepseekV4GateImpl(const ModelContext& context,
 DeepseekV4GateImpl::DeepseekV4GateImpl(const ModelArgs& args,
                                        int32_t layer_id,
                                        const torch::TensorOptions& options) {
+  layer_id_ = layer_id;
   hidden_size_ = args.hidden_size();
   n_routed_experts_ = args.n_routed_experts();
   topk_ = args.n_activated_experts();
@@ -136,6 +137,11 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
       << hidden_size_ << " got " << hidden_states.size(-1);
 
   auto logits = torch::matmul(hidden_states, weight_.transpose(0, 1));
+  debug_last_router_logits_ = logits;
+  debug_last_router_logits_before_hash_gating_ = logits;
+  debug_last_input_ids_after_comm_ = torch::Tensor();
+  debug_last_hash_topk_weights_ = torch::Tensor();
+  debug_last_hash_topk_ids_ = torch::Tensor();
 
   constexpr bool renormalize = true;
   const int64_t norm_type = score_func_to_norm_type(score_func_);
@@ -162,6 +168,7 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
   if (has_hash_table) {
     if (input_ids.has_value() && input_ids.value().defined()) {
       gate_params.input_ids = input_ids.value();
+      debug_last_input_ids_after_comm_ = input_ids.value();
     } else {
       gate_params.input_ids = c10::nullopt;
     }
@@ -178,6 +185,8 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
   }
   auto [topk_weights, topk_idx, score_out] =
       kernel::moe_gating_top_k_hash(gate_params);
+  debug_last_hash_topk_weights_ = topk_weights;
+  debug_last_hash_topk_ids_ = topk_idx.to(torch::kInt32);
   (void)score_out;
 
   if (gate_params.norm_type == 0 && renormalize) {

@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
+#include "layers/npu_torch/moe_dump_utils.h"
 
 namespace xllm {
 namespace layer {
@@ -239,6 +240,34 @@ const torch::Tensor& FusedMoEImpl::debug_last_shared_output() const {
   return debug_last_shared_output_;
 }
 
+const torch::Tensor& FusedMoEImpl::debug_last_before_allreduce() const {
+  return debug_last_before_allreduce_;
+}
+
+const torch::Tensor& FusedMoEImpl::debug_last_router_logits_input() const {
+  return debug_last_router_logits_input_;
+}
+
+const torch::Tensor& FusedMoEImpl::debug_last_input_hidden_states() const {
+  return debug_last_input_hidden_states_;
+}
+
+const torch::Tensor& FusedMoEImpl::debug_last_topk_ids() const {
+  return debug_last_topk_ids_;
+}
+
+const torch::Tensor& FusedMoEImpl::debug_last_topk_weights() const {
+  return debug_last_topk_weights_;
+}
+
+const torch::Tensor& FusedMoEImpl::debug_last_fused_experts_output() const {
+  return debug_last_fused_experts_output_;
+}
+
+const torch::Tensor& FusedMoEImpl::debug_last_routed_experts_output() const {
+  return debug_last_routed_experts_output_;
+}
+
 FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
                            const FusedMoEArgs& moe_args,
                            const QuantArgs& quant_args,
@@ -260,6 +289,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
       parallel_args_(parallel_args),
       options_(options),
       tp_pg_(parallel_args.tp_group_) {
+  debug_layer_id_ = moe_args.debug_layer_id;
   const int64_t num_experts = num_total_experts_;
   const int64_t intermediate_size =
       static_cast<int64_t>(model_args.moe_intermediate_size());
@@ -480,6 +510,8 @@ torch::Tensor FusedMoEImpl::select_experts(
         xllm::kernel::moe_active_topk(moe_active_topk_params);
     topk_ids = topk_ids.to(torch::kInt32);
   }
+  debug_last_topk_weights_ = topk_weights;
+  debug_last_topk_ids_ = topk_ids.to(torch::kInt32);
 
   xllm::kernel::MoeInitRoutingV2Params moe_init_routing_params;
   moe_init_routing_params.x = hidden_states_2d;
@@ -522,6 +554,10 @@ torch::Tensor FusedMoEImpl::forward_expert(
       hidden_states.reshape({-1, hidden_states.size(-1)});
   torch::Tensor router_logits_2d =
       router_logits.reshape({-1, router_logits.size(-1)});
+  debug_last_input_hidden_states_ = hidden_states_2d;
+  debug_last_router_logits_input_ = router_logits_2d;
+  debug_last_fused_experts_output_ = torch::Tensor();
+  debug_last_routed_experts_output_ = torch::Tensor();
 
   // Step 1-3: select experts
   SelectedExpertInfo selected_expert_info;
@@ -545,6 +581,56 @@ torch::Tensor FusedMoEImpl::forward_expert(
         xllm::kernel::dynamic_quant(quant_params);
     CHECK(pertoken_scale.has_value() && pertoken_scale->defined())
         << "dynamic_quant must return per-token scale for W8A8 fused MoE.";
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "w8a8_input_hidden_states",
+                          hidden_states_2d);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "w8a8_router_logits_input",
+                          router_logits_2d);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "w8a8_topk_ids",
+                          debug_last_topk_ids_);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "w8a8_topk_weights",
+                          debug_last_topk_weights_);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "w8a8_w13_weight",
+                          w13_);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "w8a8_w2_weight",
+                          w2_);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "w8a8_w13_weight_scale",
+                          w13_scale_);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "w8a8_w2_weight_scale",
+                          w2_scale_);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "quant_mlp_input",
+                          quantized_expand_hidden_states);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "quant_mlp_group_list",
+                          selected_expert_info.token_count_slice);
 
     // Step 5: first grouped matmul (int32 output expected for dequant+swiglu).
     if (w13_.size(1) != quantized_expand_hidden_states.size(1)) {
@@ -564,6 +650,11 @@ torch::Tensor FusedMoEImpl::forward_expert(
       group_gemm_params.output_dtype = torch::kInt32;
       gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
     }
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "antiquant_gmm1_gate_up_output",
+                          gemm1_out);
 
     // Step 6: fused dequant + swiglu + quant.
     torch::Tensor act_quantized;
@@ -579,6 +670,21 @@ torch::Tensor FusedMoEImpl::forward_expert(
       std::tie(act_quantized, act_scale) =
           xllm::kernel::dequant_swiglu_quant(params);
     }
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "gmm1_swiglu_output",
+                          act_quantized);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "antiquant_swiglu_output",
+                          act_quantized);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "gmm1_swiglu_out_scale",
+                          act_scale);
 
     // Step 7: second grouped matmul (dequant to hidden dtype).
     if (w2_.size(1) != act_quantized.size(1)) {
@@ -602,6 +708,16 @@ torch::Tensor FusedMoEImpl::forward_expert(
       group_gemm_params.output_dtype = hidden_states_dtype;
       gemm2_out = xllm::kernel::group_gemm(group_gemm_params);
     }
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "gmm2_down_proj_output",
+                          gemm2_out);
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "antiquant_gmm2_down_proj_output",
+                          gemm2_out);
   } else {
     // Step 4: group gemm 1
     {
@@ -629,6 +745,11 @@ torch::Tensor FusedMoEImpl::forward_expert(
     activation_params.is_gated = is_gated_;
     xllm::kernel::active(activation_params);
     act_out = activation_params.output;
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "else_branch_gmm1_swiglu_output",
+                          act_out);
 
     // Step 6: group gemm 2
     {
@@ -645,6 +766,11 @@ torch::Tensor FusedMoEImpl::forward_expert(
       group_gemm_params.group_list_type = 1;
       gemm2_out = xllm::kernel::group_gemm(group_gemm_params);
     }
+    moe_dump::dump_tensor(moe_dump::current_step(),
+                          tp_pg_->rank(),
+                          debug_layer_id_,
+                          "else_branch_gmm2_down_proj_output",
+                          gemm2_out);
   }
 
   // Step 8: combine the intermediate results and get the final hidden states
@@ -654,11 +780,19 @@ torch::Tensor FusedMoEImpl::forward_expert(
   moe_combine_params.reduce_weight = selected_expert_info.reduce_weight;
   moe_combine_params.gather_ids = selected_expert_info.combine_idx;
   final_hidden_states = xllm::kernel::moe_combine_result(moe_combine_params);
+  debug_last_routed_experts_output_ = final_hidden_states;
+  debug_last_fused_experts_output_ = final_hidden_states;
+  moe_dump::dump_tensor(moe_dump::current_step(),
+                        tp_pg_->rank(),
+                        debug_layer_id_,
+                        "w8a8_fused_experts_output",
+                        final_hidden_states);
   if (shared_output.has_value()) {
     final_hidden_states = final_hidden_states + shared_output.value();
   }
   // reshape the final hidden states to the original shape
   final_hidden_states = final_hidden_states.reshape(hidden_states_shape);
+  debug_last_before_allreduce_ = final_hidden_states;
 
   if (tp_pg_->world_size() > 1) {
     final_hidden_states = parallel_state::reduce(final_hidden_states, tp_pg_);

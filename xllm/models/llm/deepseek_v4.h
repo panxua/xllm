@@ -41,6 +41,7 @@ limitations under the License.
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/deepseek_v4_decoder_layer.h"
+#include "core/layers/npu_torch/moe_dump_utils.h"
 #include "core/util/tensor_helper.h"
 #include "layers/npu/deepseek_v4_rotary_embedding.h"
 #include "llm_model_base.h"
@@ -432,6 +433,8 @@ class DeepseekV4ModelImpl
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) override {
     torch::NoGradGuard no_grad;
+    const int64_t moe_dump_step = layer::moe_dump::next_step();
+    layer::moe_dump::set_current_step(moe_dump_step);
     const int32_t dump_layer_id = deepseek_v4_dump_layer_id();
     const bool should_dump_target_layer =
         dump_layer_id >= 0 &&

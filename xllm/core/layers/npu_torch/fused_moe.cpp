@@ -479,10 +479,6 @@ torch::Tensor FusedMoEImpl::select_experts(
     SelectedExpertInfo& selected_expert_info) {
   torch::Tensor topk_weights;
   torch::Tensor topk_ids;
-  std::optional<torch::Tensor> e_score_correction_bias = std::nullopt;
-  if (e_score_correction_bias_.defined()) {
-    e_score_correction_bias = e_score_correction_bias_;
-  }
   if (preselected_experts_.has_value()) {
     const auto& selected = preselected_experts_.value();
     topk_weights = selected.first.reshape({-1, topk_});
@@ -496,16 +492,19 @@ torch::Tensor FusedMoEImpl::select_experts(
     topk_weights = topk_weights.to(hidden_states_2d.dtype());
   } else {
     // prepare the parameters for select_experts
+    torch::Tensor adjusted_logits = router_logits_2d;
+    if (e_score_correction_bias_.defined()) {
+      adjusted_logits = adjusted_logits + e_score_correction_bias_.to(adjusted_logits.dtype());
+    }
     xllm::kernel::MoeFusedTopkParams moe_active_topk_params;
-    moe_active_topk_params.input = router_logits_2d;
+    moe_active_topk_params.input = adjusted_logits;
     moe_active_topk_params.topk = topk_;
     // moe_active_topk_params.num_expert_group = num_expert_group_;
     // moe_active_topk_params.topk_group = topk_group_;
     moe_active_topk_params.normalize = static_cast<bool>(renormalize_);
     // moe_active_topk_params.normed_by = "topk_logit";
     moe_active_topk_params.scoring_func = scoring_func_;
-    // moe_active_topk_params.route_scale = route_scale_;
-    // moe_active_topk_params.e_score_correction_bias = e_score_correction_bias;
+    moe_active_topk_params.route_scale = route_scale_;
     std::tie(topk_weights, topk_ids) =
         xllm::kernel::moe_active_topk(moe_active_topk_params);
     topk_ids = topk_ids.to(torch::kInt32);
@@ -647,8 +646,6 @@ torch::Tensor FusedMoEImpl::forward_expert(
       group_gemm_params.split_item = 2;
       group_gemm_params.group_type = 0;
       group_gemm_params.group_list_type = 1;
-      group_gemm_params.output_dtype = torch::kInt32;
-      gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
     }
     moe_dump::dump_tensor(moe_dump::current_step(),
                           tp_pg_->rank(),
@@ -656,14 +653,11 @@ torch::Tensor FusedMoEImpl::forward_expert(
                           "antiquant_gmm1_gate_up_output",
                           gemm1_out);
 
-    // Step 6: fused dequant + swiglu + quant.
     torch::Tensor act_quantized;
     torch::Tensor act_scale;
     {
       xllm::kernel::DequantSwigluQuantParams params;
       params.x = gemm1_out;
-      params.weight_scale = w13_scale_;
-      params.activation_scale = pertoken_scale.value();
       params.group_index = selected_expert_info.token_count_slice;
       params.activate_left = true;
       params.quant_mode = 1;
@@ -788,7 +782,9 @@ torch::Tensor FusedMoEImpl::forward_expert(
                         "w8a8_fused_experts_output",
                         final_hidden_states);
   if (shared_output.has_value()) {
-    final_hidden_states = final_hidden_states + shared_output.value();
+    final_hidden_states = final_hidden_states * route_scale_ + shared_output.value();
+  } else if (route_scale_ != 1.0) {
+    final_hidden_states = final_hidden_states * route_scale_;
   }
   // reshape the final hidden states to the original shape
   final_hidden_states = final_hidden_states.reshape(hidden_states_shape);

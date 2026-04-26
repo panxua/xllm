@@ -751,7 +751,7 @@ torch::Tensor FusedMoEImpl::forward_expert(
         "ffn/shared_output_add", "input_moe", final_hidden_states);
     tensor_dump::save_tensor(
         "ffn/shared_output_add", "input_shared", shared_output.value());
-    final_hidden_states = final_hidden_states + shared_output.value();
+    final_hidden_states = final_hidden_states * route_scale_ + shared_output.value();
     tensor_dump::save_tensor(
         "ffn/shared_output_add", "output", final_hidden_states);
   }
@@ -794,7 +794,8 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
     shared_output = shared_experts_(input);
     tensor_dump::save_optional_tensor(
         "ffn/shared_experts", "output_raw", shared_output);
-    if (shared_expert_gate_) {
+    if (shared_expert_gate_->weight.defined()) {
+      LOG(INFO) << "Warning: dsv4 do not has shared expert gate";
       tensor_dump::save_tensor("ffn/shared_expert_gate", "input", input);
       auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
       tensor_dump::save_tensor(
@@ -889,7 +890,7 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
     shared_output = shared_experts_(input);
     tensor_dump::save_optional_tensor(
         "ffn/shared_experts", "output_raw", shared_output);
-    if (shared_expert_gate_) {
+    if (shared_expert_gate_->weight.defined()) {
       tensor_dump::save_tensor("ffn/shared_expert_gate", "input", input);
       auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
       tensor_dump::save_tensor(

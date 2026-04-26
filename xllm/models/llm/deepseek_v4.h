@@ -1188,7 +1188,7 @@ inline void load_deepseek_v4_model_args(const JsonReader& json,
   LOAD_ARG_OR(n_shared_experts, "n_shared_experts", 1);
   LOAD_ARG_OR(moe_intermediate_size, "moe_intermediate_size", 2048);
   LOAD_ARG_OR(n_hash_layers, "num_hash_layers", 3);
-  LOAD_ARG_OR(route_scale, "routed_scaling_factor", 1.0f);
+  LOAD_ARG_OR(route_scale, "routed_scaling_factor", 1.5f);
   LOAD_ARG_OR(score_func, "scoring_func", "sqrtsoftplus");
 
   // Indexer

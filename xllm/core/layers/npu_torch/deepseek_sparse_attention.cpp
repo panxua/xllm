@@ -709,9 +709,15 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
 
   tensor_dump::save_tensor("attention/sparse_attn_sharedkv", "input_q", q);
   tensor_dump::save_tensor(
-      "attention/sparse_attn_sharedkv", "input_ori_kv", ori_kv);
-  tensor_dump::save_tensor(
-      "attention/sparse_attn_sharedkv", "input_cmp_kv", cmp_kv);
+      "attention/sparse_attn_sharedkv",
+      isprefill ? "input_ori_kv_prefill" : "input_ori_kv_decode",
+      ori_kv_for_attn);
+  if (cmp_kv_for_attn.defined()) {
+    tensor_dump::save_tensor(
+        "attention/sparse_attn_sharedkv",
+        isprefill ? "input_cmp_kv_prefill" : "input_cmp_kv_decode",
+        cmp_kv_for_attn);
+  }
   tensor_dump::save_tensor("attention/sparse_attn_sharedkv",
                            "input_cmp_sparse_indices",
                            compress_topk_idxs);

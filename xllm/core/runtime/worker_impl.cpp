@@ -1142,6 +1142,7 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
           kModelTypeToMtpType = {
               {"deepseek_v3", "deepseek_v3_mtp"},
               {"deepseek_v32", "deepseek_v3_mtp"},
+              {"deepseek_v4", "deepseek_v4_mtp"},
               {"glm_moe_dsa", "glm_moe_dsa_mtp"},
           };
       const std::string& current_type = args.model_type();

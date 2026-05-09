@@ -123,13 +123,11 @@ class DeepseekV4MultiTokenPredictorLayerImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    auto prefix = state_dict.prefix();
-    e_proj_->load_state_dict(state_dict.get_dict_with_prefix(prefix + "e_proj"));
-    h_proj_->load_state_dict(state_dict.get_dict_with_prefix(prefix + "h_proj"));
-    enorm_->load_state_dict(state_dict.get_dict_with_prefix(prefix + "enorm"));
-    hnorm_->load_state_dict(state_dict.get_dict_with_prefix(prefix + "hnorm"));
-    mtp_block_->load_state_dict(
-        state_dict.get_dict_with_prefix(prefix + "mtp_block"));
+    e_proj_->load_state_dict(state_dict.get_dict_with_prefix("e_proj"));
+    h_proj_->load_state_dict(state_dict.get_dict_with_prefix("h_proj"));
+    enorm_->load_state_dict(state_dict.get_dict_with_prefix("enorm"));
+    hnorm_->load_state_dict(state_dict.get_dict_with_prefix("hnorm"));
+    mtp_block_->load_state_dict(state_dict);
     LOAD_WEIGHT(hc_head_fn);
     LOAD_WEIGHT(hc_head_base);
     LOAD_WEIGHT(hc_head_scale);
@@ -285,13 +283,12 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    auto prefix = state_dict.prefix();
     for (size_t i = 0; i < mtp_layers_.size(); ++i) {
       mtp_layers_[i]->load_state_dict(state_dict.get_dict_with_prefix(
-          prefix + "mtp." + std::to_string(i) + "."));
+          "mtp." + std::to_string(i) + "."));
     }
     final_norm_->load_state_dict(
-        state_dict.get_dict_with_prefix(prefix + "final_norm"));
+        state_dict.get_dict_with_prefix("norm.")); 
     embed_tokens_->load_state_dict(state_dict.get_dict_with_prefix("embed."));
   }
 

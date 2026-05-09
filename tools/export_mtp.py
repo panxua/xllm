@@ -27,7 +27,22 @@ import shutil
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
+
+
+def load_config(input_dir):
+    try:
+        return AutoConfig.from_pretrained(input_dir, trust_remote_code=True)
+    except KeyError:
+        config_path = os.path.join(input_dir, "config.json")
+        with open(config_path, encoding="utf-8") as f:
+            config_dict = json.load(f)
+
+        if str(config_dict.get("model_type", "")).lower() != "deepseek_v4":
+            raise
+
+        print("AutoConfig does not support deepseek_v4 in this transformers version, falling back to PretrainedConfig.")
+        return PretrainedConfig(**config_dict)
 
 
 def detect_model_type(config):
@@ -237,7 +252,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    config = AutoConfig.from_pretrained(args.input_dir, trust_remote_code=True)
+    config = load_config(args.input_dir)
 
     if args.model_type:
         model_type = args.model_type.lower()

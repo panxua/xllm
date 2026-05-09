@@ -288,7 +288,7 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     auto prefix = state_dict.prefix();
     for (size_t i = 0; i < mtp_layers_.size(); ++i) {
       mtp_layers_[i]->load_state_dict(state_dict.get_dict_with_prefix(
-          prefix + "mtp_layers." + std::to_string(i) + "."));
+          prefix + "mtp." + std::to_string(i) + "."));
     }
     final_norm_->load_state_dict(
         state_dict.get_dict_with_prefix(prefix + "final_norm"));

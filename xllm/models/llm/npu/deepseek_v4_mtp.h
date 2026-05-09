@@ -291,10 +291,47 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     embed_tokens_->load_state_dict(state_dict.get_dict_with_prefix("embed."));
   }
 
-  void verify_loaded_weights() const {
+  void verify_loaded_weights(const std::string& prefix) const {
+    UNUSED_PARAMETER(prefix);
     for (const auto& layer : mtp_layers_) {
       layer->verify_loaded_weights();
     }
+  }
+
+  void merge_loaded_weights() {
+    for (const auto& layer : mtp_layers_) {
+      UNUSED_PARAMETER(layer);
+    }
+  }
+
+  void merge_and_move_pinned_host() {
+    merge_loaded_weights();
+  }
+
+  void free_weights() {}
+
+  void reload_weights() {}
+
+  void reload_non_decoder_weights() {}
+
+  void reload_weights_from_device() {}
+
+  void refresh_rolling_weights() {}
+
+  layer::NpuWordEmbedding get_npu_word_embedding() {
+    return layer::NpuWordEmbedding(nullptr);
+  }
+
+  void set_npu_word_embedding(layer::NpuWordEmbedding& npu_word_embedding) {
+    UNUSED_PARAMETER(npu_word_embedding);
+  }
+
+  std::vector<layer::BaseManualLoader*> get_decoder_loaders() {
+    return {};
+  }
+
+  void set_rolling_load_manager(RollingLoadManager* mgr) {
+    UNUSED_PARAMETER(mgr);
   }
 
   ModelOutput forward(torch::Tensor tokens,

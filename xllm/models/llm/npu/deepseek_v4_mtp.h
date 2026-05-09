@@ -284,11 +284,11 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
   void load_state_dict(const StateDict& state_dict) {
     for (size_t i = 0; i < mtp_layers_.size(); ++i) {
       mtp_layers_[i]->load_state_dict(state_dict.get_dict_with_prefix(
-          "mtp." + std::to_string(i) + "."));
+          "layers." + std::to_string(i) + "."));
     }
-    final_norm_->load_state_dict(
-        state_dict.get_dict_with_prefix("norm.")); 
-    embed_tokens_->load_state_dict(state_dict.get_dict_with_prefix("embed."));
+    final_norm_->load_state_dict(state_dict.get_dict_with_prefix("norm."));
+    embed_tokens_->load_state_dict(
+        state_dict.get_dict_with_prefix("embed_tokens."));
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
@@ -1280,6 +1280,22 @@ class DeepseekV4MtpForCausalLMImpl
  public:
   explicit DeepseekV4MtpForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<DeepseekV4MtpModel>(context) {}
+
+  void load_model(
+      std::unique_ptr<ModelLoader> loader,
+      std::string prefix = "model." /*llm model weight prefix*/) override {
+    for (const auto& state_dict : loader->get_state_dicts()) {
+      model_->load_state_dict(state_dict->get_dict_with_prefix(prefix));
+      npu_lm_head_->load_state_dict(
+          state_dict->get_dict_with_prefix(prefix + "head."));
+    }
+
+    model_->verify_loaded_weights(prefix);
+    npu_lm_head_->verify_loaded_weights(prefix + "head.");
+
+    model_->merge_loaded_weights();
+    npu_lm_head_->merge_loaded_weights();
+  }
 };
 TORCH_MODULE(DeepseekV4MtpForCausalLM);
 

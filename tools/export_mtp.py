@@ -33,7 +33,7 @@ from transformers import AutoConfig, PretrainedConfig
 def load_config(input_dir):
     try:
         return AutoConfig.from_pretrained(input_dir, trust_remote_code=True)
-    except KeyError:
+    except (KeyError, ValueError):
         config_path = os.path.join(input_dir, "config.json")
         with open(config_path, encoding="utf-8") as f:
             config_dict = json.load(f)
@@ -157,10 +157,55 @@ def block_dequant(
     return x_dq_block.to(torch.bfloat16)
 
 
+def normalize_deepseek_v4_mtp_key(key):
+    if key == "rot.weight":
+        return "model.rot.weight"
+
+    bare_shared_mapping = {
+        "embed.": "model.embed_tokens.",
+        "embed_tokens.": "model.embed_tokens.",
+        "emb.tok_emb.": "model.embed_tokens.",
+        "norm.": "model.norm.",
+        "head.": "model.head.",
+        "shared_head.norm.": "model.norm.",
+        "shared_head.head.": "model.head.",
+    }
+    for old_prefix, new_prefix in bare_shared_mapping.items():
+        if key.startswith(old_prefix):
+            return key.replace(old_prefix, new_prefix, 1)
+
+    if key in ["hc_head_fn", "hc_head_base", "hc_head_scale"]:
+        return f"model.layers.0.{key}"
+
+    prefix = "mtp.0."
+    if not key.startswith(prefix):
+        return None
+
+    name = key[len(prefix):]
+    mtp_shared_mapping = {
+        "embed.": "model.embed_tokens.",
+        "embed_tokens.": "model.embed_tokens.",
+        "emb.tok_emb.": "model.embed_tokens.",
+        "norm.": "model.norm.",
+        "head.": "model.head.",
+        "shared_head.norm.": "model.norm.",
+        "shared_head.head.": "model.head.",
+    }
+    for old_prefix, new_prefix in mtp_shared_mapping.items():
+        if name.startswith(old_prefix):
+            return name.replace(old_prefix, new_prefix, 1)
+
+    return f"model.layers.0.{name}"
+
+
+def is_deepseek_v4_mtp_key(key):
+    return normalize_deepseek_v4_mtp_key(key) is not None
+
+
 def export_mtp_layer_parameters(input_dir, output_dir, config, model_type):
     """Export MTP layer parameters for the specified model type."""
     if model_type == "deepseek_v4":
-        prefix = "mtp.0."
+        prefix = None
     else:
         if not hasattr(config, "num_hidden_layers"):
             raise ValueError("'num_hidden_layers' not found in model config.")
@@ -178,17 +223,22 @@ def export_mtp_layer_parameters(input_dir, output_dir, config, model_type):
 
         try:
             with safe_open(file_path, framework="pt") as f:
-                matching_keys = [k for k in f.keys() if (k.startswith(prefix) or k == "rot.weight")]
+                if model_type == "deepseek_v4":
+                    matching_keys = [k for k in f.keys() if is_deepseek_v4_mtp_key(k)]
+                    no_match_message = "  No DeepSeek V4 MTP parameters found"
+                else:
+                    matching_keys = [k for k in f.keys() if (k.startswith(prefix) or k == "rot.weight")]
+                    no_match_message = f"  No parameters starting with '{prefix}' found"
 
                 if not matching_keys:
-                    print(f"  No parameters starting with '{prefix}' found")
+                    print(no_match_message)
                     continue
 
                 for key in matching_keys:
-                    if key == "rot.weight":
+                    if model_type == "deepseek_v4":
+                        new_key = normalize_deepseek_v4_mtp_key(key)
+                    elif key == "rot.weight":
                         new_key = "model.rot.weight"
-                    elif model_type == "deepseek_v4":
-                        new_key = key
                     elif any(special in key for special in ["embed_tokens", "shared_head", "enorm", "hnorm", "eh_proj"]):
                         new_key = key.replace(prefix, "model")
                     else:
@@ -215,7 +265,7 @@ def export_mtp_layer_parameters(input_dir, output_dir, config, model_type):
         save_file(params, output_path)
     else:
         print("No matching parameters found.")
-        raise ValueError(f"No MTP layer parameters found with prefix '{prefix}'")
+        raise ValueError("No MTP layer parameters found")
 
     index_path = os.path.join(output_dir, "model.safetensors.index.json")
     print(f"Updating safetensors index to {index_path}")

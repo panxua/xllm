@@ -16,7 +16,6 @@ limitations under the License.
 #pragma once
 
 #include <absl/strings/str_join.h>
- #include <absl/strings/str_join.h>
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -144,8 +143,8 @@ class DeepseekV4MultiTokenPredictorLayerImpl : public torch::nn::Module {
                         torch::Tensor tokens) {
     torch::NoGradGuard no_grad;
 
-    auto e_norm = enorm_(inputs_embeds, std::nullopt).first;
-    auto h_norm = hnorm_(previous_hidden_states, std::nullopt).first;
+    auto [e_norm, _1] = enorm_(inputs_embeds, std::nullopt);
+    auto [h_norm, _2] = hnorm_(previous_hidden_states, std::nullopt);
     auto hidden_states = e_proj_(e_norm) + h_proj_(h_norm);
 
     if (hidden_states.dim() == 2) {
@@ -471,7 +470,7 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
 
   static torch::Tensor expand_blocks_to_slots(
       const torch::Tensor& block_table,
-      const layer::DSAGroupInfo& gi,
+      const DSAGroupInfo& gi,
       const std::vector<int>& ctx_lens,
       int32_t batch_size,
       int64_t total_tokens) {
@@ -501,8 +500,8 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     return slots;
   }
 
-  static int64_t compute_slot_num(const layer::DSAGroupInfo& gi, int64_t token_len) {
-    if (gi.type == layer::DSACacheType::TOKEN) {
+  static int64_t compute_slot_num(const DSAGroupInfo& gi, int64_t token_len) {
+    if (gi.type == DSACacheType::TOKEN) {
       return token_len / gi.ratio;
     }
     const int32_t bs = gi.block_size;
@@ -515,7 +514,7 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
 
   static void process_group(const torch::Tensor& raw_bt,
                            const torch::Tensor& raw_slots,
-                           const layer::DSAGroupInfo& gi,
+                           const DSAGroupInfo& gi,
                            const std::vector<int>& ctx_lens,
                            const std::vector<int>& q_lens_vec,
                            int32_t batch_size,
@@ -529,10 +528,10 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
       q_lens.assign(batch_size, 1);
     }
 
-    if (gi.type == layer::DSACacheType::TOKEN) {
+    if (gi.type == DSACacheType::TOKEN) {
       process_token_group(raw_bt, raw_slots, gi.ratio, ctx_lens, q_lens,
                           batch_size, total_tokens, out_bt, out_slots);
-    } else if (gi.type == layer::DSACacheType::SLIDING_WINDOW) {
+    } else if (gi.type == DSACacheType::SLIDING_WINDOW) {
       process_swa_group(raw_bt, raw_slots, gi.block_size, ctx_lens, q_lens,
                         batch_size, out_bt, out_slots);
     } else {
@@ -743,7 +742,7 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
 
     struct DSAGroupKey {
       int32_t ratio;
-      layer::DSACacheType type;
+      DSACacheType type;
       int32_t block_size;
       bool operator==(const DSAGroupKey& o) const {
         return ratio == o.ratio && type == o.type && block_size == o.block_size;
@@ -760,7 +759,7 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     };
 
     std::unordered_map<DSAGroupKey, int32_t, DSAGroupKeyHash> group_key_map;
-    auto register_group = [&](layer::DSACacheType type, int32_t ratio,
+    auto register_group = [&](DSACacheType type, int32_t ratio,
                               int32_t block_size) -> int32_t {
       DSAGroupKey key{ratio, type, block_size};
       auto it = group_key_map.find(key);
@@ -773,11 +772,11 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
       return gid;
     };
 
-    register_group(layer::DSACacheType::SLIDING_WINDOW, 1, window_size);
+    register_group(DSACacheType::SLIDING_WINDOW, 1, window_size);
     for (const auto ratio : compress_ratios) {
       const int32_t cr = deepseek_v4_mtp_normalize_compress_ratio(ratio);
       if (cr == 4 || cr == 128) {
-        register_group(layer::DSACacheType::TOKEN, cr, base_block_size);
+        register_group(DSACacheType::TOKEN, cr, base_block_size);
       }
     }
 
@@ -790,7 +789,7 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
       cr = deepseek_v4_mtp_normalize_compress_ratio(cr);
 
       struct CacheEntry {
-        layer::DSACacheType type;
+        DSACacheType type;
         int32_t ratio;
         int32_t block_size;
       };
@@ -798,30 +797,30 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
 
       if (cr == 1) {
         layer_caches.push_back(
-            {layer::DSACacheType::SLIDING_WINDOW, 1, window_size});
+            {DSACacheType::SLIDING_WINDOW, 1, window_size});
       } else if (cr == 4) {
-        layer_caches.push_back({layer::DSACacheType::TOKEN, 4, base_block_size});
-        layer_caches.push_back({layer::DSACacheType::TOKEN, 4, base_block_size});
+        layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
+        layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
         layer_caches.push_back(
-            {layer::DSACacheType::SLIDING_WINDOW, 1, window_size});
+            {DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back(
-            {layer::DSACacheType::SLIDING_WINDOW, 1, window_size});
+            {DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back(
-            {layer::DSACacheType::SLIDING_WINDOW, 1, window_size});
+            {DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back(
-            {layer::DSACacheType::SLIDING_WINDOW, 1, window_size});
+            {DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back(
-            {layer::DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({layer::DSACacheType::TOKEN, 4, base_block_size});
+            {DSACacheType::SLIDING_WINDOW, 1, window_size});
+        layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
       } else if (cr == 128) {
         layer_caches.push_back(
-            {layer::DSACacheType::TOKEN, 128, base_block_size});
+            {DSACacheType::TOKEN, 128, base_block_size});
         layer_caches.push_back(
-            {layer::DSACacheType::SLIDING_WINDOW, 1, window_size});
+            {DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back(
-            {layer::DSACacheType::SLIDING_WINDOW, 1, window_size});
+            {DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back(
-            {layer::DSACacheType::SLIDING_WINDOW, 1, window_size});
+            {DSACacheType::SLIDING_WINDOW, 1, window_size});
       }
 
       for (const auto& ce : layer_caches) {
@@ -1193,7 +1192,7 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
         const auto& layer_caches = caches_info_[layer_id];
         for (size_t cache_idx = 0; cache_idx < layer_caches.size(); ++cache_idx) {
           if (layer_caches[cache_idx].type ==
-              layer::DSACacheType::SLIDING_WINDOW) {
+              DSACacheType::SLIDING_WINDOW) {
             attn_cache_idx = cache_idx;
             break;
           }
@@ -1217,8 +1216,8 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
   torch::Tensor dsa_cos_sin_;
   torch::Tensor dsa_hadamard_;
 
-  std::vector<std::vector<layer::DSACacheInfo>> caches_info_;
-  std::vector<layer::DSAGroupInfo> group_infos_;
+  std::vector<std::vector<DSACacheInfo>> caches_info_;
+  std::vector<DSAGroupInfo> group_infos_;
 
   int64_t num_heads_ = 0;
   int64_t tp_num_heads_ = 0;

@@ -287,19 +287,10 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
           "layers." + std::to_string(i) + "."));
     }
 
-    auto norm_state = state_dict.get_dict_with_prefix("norm.");
-    if (norm_state.size() == 0 && !mtp_layers_.empty()) {
-      norm_state = state_dict.get_dict_with_prefix(
-          "layers." + std::to_string(mtp_layers_.size() - 1) +
-          ".shared_head.norm.");
-    }
-    final_norm_->load_state_dict(norm_state);
-
-    auto embed_state = state_dict.get_dict_with_prefix("embed.");
-    if (embed_state.size() == 0) {
-      embed_state = state_dict.get_dict_with_prefix("embed_tokens.");
-    }
-    embed_tokens_->load_state_dict(embed_state);
+    final_norm_->load_state_dict(
+        state_dict.get_dict_with_prefix("layers.0.norm."));
+    embed_tokens_->load_state_dict(
+        state_dict.get_dict_with_prefix("layers.0.emb.tok_emb."));
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
@@ -1288,11 +1279,9 @@ class DeepseekV4MtpForCausalLMImpl
       std::unique_ptr<ModelLoader> loader,
       std::string prefix = "model.") override {
     for (const auto& state_dict : loader->get_state_dicts()) {
-      auto sub_dict = state_dict->get_dict_with_prefix(prefix);
-      if (sub_dict.size() == 0) {
-        sub_dict = state_dict->get_dict_with_prefix("");
-      }
-      model_->load_state_dict(sub_dict);
+      model_->load_state_dict(state_dict->get_dict_with_prefix(prefix));
+      lm_head_->load_state_dict(
+          state_dict->get_dict_with_prefix(prefix + "layers.0.head."));
     }
     model_->verify_loaded_weights(prefix);
   }

@@ -136,8 +136,6 @@ def map_mtp_key(key, prefix, model_type):
         return None
 
     if model_type == "deepseek_v4":
-        if key.startswith((prefix + "embed.", prefix + "embed_tokens.", prefix + "norm.")):
-            return key.replace(prefix, "model.", 1)
         return key.replace(prefix, "model.layers.0.", 1)
 
     if any(special in key for special in ["embed_tokens", "shared_head", "enorm", "hnorm", "eh_proj"]):

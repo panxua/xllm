@@ -33,7 +33,7 @@ from transformers import AutoConfig, PretrainedConfig
 def load_config(input_dir):
     try:
         return AutoConfig.from_pretrained(input_dir, trust_remote_code=True)
-    except KeyError:
+    except ValueError:
         config_path = os.path.join(input_dir, "config.json")
         with open(config_path, encoding="utf-8") as f:
             config_dict = json.load(f)

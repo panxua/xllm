@@ -183,7 +183,8 @@ bool WorkerImpl::allocate_kv_cache(
       << "simultaneously.";
 
   const int64_t num_layers = get_num_layers();
-  const bool is_dsv4 = (args.model_type() == "deepseek_v4") &&
+  const bool is_dsv4 = (args.model_type() == "deepseek_v4" ||
+                       args.model_type() == "deepseek_v4_mtp") &&
                        kv_cache_shape.size() >= 1 &&
                        kv_cache_shape[0].size() >= 3;
 

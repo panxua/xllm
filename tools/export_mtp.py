@@ -108,6 +108,8 @@ def update_and_save_config(config, output_dir, model_type):
     }
 
     updates["first_k_dense_replace"] = 0
+    if model_type == "deepseek_v4":
+        updates["num_hash_layers"] = 0
 
     new_config.update(updates)
 

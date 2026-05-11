@@ -1293,6 +1293,7 @@ inline void load_deepseek_v4_mtp_model_args(const JsonReader& json,
   load_deepseek_v4_model_args(json, args);
   LOAD_ARG_OR(model_type, "model_type", "deepseek_v4_mtp");
   LOAD_ARG_OR(num_nextn_predict_layers, "num_nextn_predict_layers", 1);
+  SET_ARG(n_hash_layers, 0);
 }
 
 REGISTER_CAUSAL_MODEL(deepseek_v4_mtp, DeepseekV4MtpForCausalLM);

@@ -44,7 +44,7 @@ limitations under the License.
 #include "models/llm/deepseek_v4.h"
 #include "models/llm/llm_model_base.h"
 
-namespace xllm::npu::model {
+namespace xllm {
 
 inline int64_t deepseek_v4_mtp_next_power_of_two(int64_t n) {
   int64_t value = 1;
@@ -122,10 +122,10 @@ class DeepseekV4MultiTokenPredictorLayerImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    e_proj_->load_state_dict(state_dict.get_dict_with_prefix("e_proj"));
-    h_proj_->load_state_dict(state_dict.get_dict_with_prefix("h_proj"));
-    enorm_->load_state_dict(state_dict.get_dict_with_prefix("enorm"));
-    hnorm_->load_state_dict(state_dict.get_dict_with_prefix("hnorm"));
+    e_proj_->load_state_dict(state_dict.get_dict_with_prefix("e_proj."));
+    h_proj_->load_state_dict(state_dict.get_dict_with_prefix("h_proj."));
+    enorm_->load_state_dict(state_dict.get_dict_with_prefix("enorm."));
+    hnorm_->load_state_dict(state_dict.get_dict_with_prefix("hnorm."));
     mtp_block_->load_state_dict(state_dict);
     LOAD_WEIGHT(hc_head_fn);
     LOAD_WEIGHT(hc_head_base);
@@ -284,11 +284,22 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
   void load_state_dict(const StateDict& state_dict) {
     for (size_t i = 0; i < mtp_layers_.size(); ++i) {
       mtp_layers_[i]->load_state_dict(state_dict.get_dict_with_prefix(
-          "mtp." + std::to_string(i) + "."));
+          "layers." + std::to_string(i) + "."));
     }
-    final_norm_->load_state_dict(
-        state_dict.get_dict_with_prefix("norm.")); 
-    embed_tokens_->load_state_dict(state_dict.get_dict_with_prefix("embed."));
+
+    auto norm_state = state_dict.get_dict_with_prefix("norm.");
+    if (norm_state.size() == 0 && !mtp_layers_.empty()) {
+      norm_state = state_dict.get_dict_with_prefix(
+          "layers." + std::to_string(mtp_layers_.size() - 1) +
+          ".shared_head.norm.");
+    }
+    final_norm_->load_state_dict(norm_state);
+
+    auto embed_state = state_dict.get_dict_with_prefix("embed.");
+    if (embed_state.size() == 0) {
+      embed_state = state_dict.get_dict_with_prefix("embed_tokens.");
+    }
+    embed_tokens_->load_state_dict(embed_state);
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
@@ -318,20 +329,12 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
 
   void refresh_rolling_weights() {}
 
-  layer::NpuWordEmbedding get_npu_word_embedding() {
-    return layer::NpuWordEmbedding(nullptr);
+  layer::WordEmbedding get_word_embedding() {
+    return embed_tokens_;
   }
 
-  void set_npu_word_embedding(layer::NpuWordEmbedding& npu_word_embedding) {
-    UNUSED_PARAMETER(npu_word_embedding);
-  }
-
-  std::vector<layer::BaseManualLoader*> get_decoder_loaders() {
-    return {};
-  }
-
-  void set_rolling_load_manager(RollingLoadManager* mgr) {
-    UNUSED_PARAMETER(mgr);
+  void set_word_embedding(layer::WordEmbedding& word_embedding) {
+    embed_tokens_ = word_embedding;
   }
 
   ModelOutput forward(torch::Tensor tokens,
@@ -1280,6 +1283,19 @@ class DeepseekV4MtpForCausalLMImpl
  public:
   explicit DeepseekV4MtpForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<DeepseekV4MtpModel>(context) {}
+
+  void load_model(
+      std::unique_ptr<ModelLoader> loader,
+      std::string prefix = "model.") override {
+    for (const auto& state_dict : loader->get_state_dicts()) {
+      auto sub_dict = state_dict->get_dict_with_prefix(prefix);
+      if (sub_dict.size() == 0) {
+        sub_dict = state_dict->get_dict_with_prefix("");
+      }
+      model_->load_state_dict(sub_dict);
+    }
+    model_->verify_loaded_weights(prefix);
+  }
 };
 TORCH_MODULE(DeepseekV4MtpForCausalLM);
 
@@ -1301,4 +1317,4 @@ REGISTER_MODEL_ARGS(deepseek_v4_mtp, [&] {
   normalize_deepseek_v4_args(args);
 });
 
-}  // namespace xllm::npu::model
+}  // namespace xllm

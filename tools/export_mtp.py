@@ -188,7 +188,10 @@ def export_mtp_layer_parameters(input_dir, output_dir, config, model_type):
                     if key == "rot.weight":
                         new_key = "model.rot.weight"
                     elif model_type == "deepseek_v4":
-                        new_key = key
+                        if key.startswith((prefix + "embed.", prefix + "embed_tokens.", prefix + "norm.")):
+                            new_key = key.replace(prefix, "model.", 1)
+                        else:
+                            new_key = key.replace(prefix, "model.layers.0.", 1)
                     elif any(special in key for special in ["embed_tokens", "shared_head", "enorm", "hnorm", "eh_proj"]):
                         new_key = key.replace(prefix, "model")
                     else:

@@ -128,6 +128,46 @@ def copy_non_safetensors_files(input_dir, output_dir):
     print(f"All non-safetensors files have been copied to {output_dir}")
 
 
+def map_mtp_key(key, prefix, model_type):
+    if key == "rot.weight":
+        return "model.rot.weight"
+
+    if not key.startswith(prefix):
+        return None
+
+    if model_type == "deepseek_v4":
+        if key.startswith((prefix + "embed.", prefix + "embed_tokens.", prefix + "norm.")):
+            return key.replace(prefix, "model.", 1)
+        return key.replace(prefix, "model.layers.0.", 1)
+
+    if any(special in key for special in ["embed_tokens", "shared_head", "enorm", "hnorm", "eh_proj"]):
+        return key.replace(prefix, "model")
+    return key.replace(prefix, "model.layers.0")
+
+
+def update_quant_model_description(input_dir, output_dir, prefix, model_type):
+    filename = "quant_model_description.json"
+    input_path = os.path.join(input_dir, filename)
+    output_path = os.path.join(output_dir, filename)
+
+    if not os.path.exists(input_path):
+        return
+
+    with open(input_path, encoding="utf-8") as f:
+        quant_desc = json.load(f)
+
+    updated_desc = {}
+    for key, value in quant_desc.items():
+        new_key = map_mtp_key(key, prefix, model_type)
+        if new_key is not None:
+            updated_desc[new_key] = value
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(updated_desc, f, indent=2, ensure_ascii=False, sort_keys=True)
+
+    print(f"Updated {filename} with {len(updated_desc)} MTP entries")
+
+
 def block_dequant(
     x_q_block: torch.Tensor,
     x_s: torch.Tensor,
@@ -157,14 +197,18 @@ def block_dequant(
     return x_dq_block.to(torch.bfloat16)
 
 
+def get_mtp_weight_prefix(config, model_type):
+    if model_type == "deepseek_v4":
+        return "mtp.0."
+
+    if not hasattr(config, "num_hidden_layers"):
+        raise ValueError("'num_hidden_layers' not found in model config.")
+    return f"model.layers.{config.num_hidden_layers}."
+
+
 def export_mtp_layer_parameters(input_dir, output_dir, config, model_type):
     """Export MTP layer parameters for the specified model type."""
-    if model_type == "deepseek_v4":
-        prefix = "mtp.0."
-    else:
-        if not hasattr(config, "num_hidden_layers"):
-            raise ValueError("'num_hidden_layers' not found in model config.")
-        prefix = f"model.layers.{config.num_hidden_layers}."
+    prefix = get_mtp_weight_prefix(config, model_type)
 
     output_path = os.path.join(output_dir, "mtp_layer_parameters.safetensors")
     params = {}
@@ -185,17 +229,9 @@ def export_mtp_layer_parameters(input_dir, output_dir, config, model_type):
                     continue
 
                 for key in matching_keys:
-                    if key == "rot.weight":
-                        new_key = "model.rot.weight"
-                    elif model_type == "deepseek_v4":
-                        if key.startswith((prefix + "embed.", prefix + "embed_tokens.", prefix + "norm.")):
-                            new_key = key.replace(prefix, "model.", 1)
-                        else:
-                            new_key = key.replace(prefix, "model.layers.0.", 1)
-                    elif any(special in key for special in ["embed_tokens", "shared_head", "enorm", "hnorm", "eh_proj"]):
-                        new_key = key.replace(prefix, "model")
-                    else:
-                        new_key = key.replace(prefix, "model.layers.0")
+                    new_key = map_mtp_key(key, prefix, model_type)
+                    if new_key is None:
+                        continue
                     params[new_key] = f.get_tensor(key)
 
         except Exception as e:
@@ -274,6 +310,9 @@ if __name__ == "__main__":
     copy_non_safetensors_files(args.input_dir, args.output_dir)
 
     update_and_save_config(config, args.output_dir, model_type)
+
+    prefix = get_mtp_weight_prefix(config, model_type)
+    update_quant_model_description(args.input_dir, args.output_dir, prefix, model_type)
 
     export_mtp_layer_parameters(args.input_dir, args.output_dir, config, model_type)
 

@@ -341,12 +341,20 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
 
     const torch::Device runtime_device = tokens.device();
 
-    auto inputs_embeds = input_params.input_embedding;
-    torch::Tensor previous_hidden_states =
-        inputs_embeds.defined() ? inputs_embeds : embed_tokens_(tokens);
+    torch::Tensor previous_hidden_states = input_params.input_embedding;
+    CHECK(previous_hidden_states.defined())
+        << "input_params.input_embedding must be defined for MTP model";
+
+    torch::Tensor hidden_states = embed_tokens_(tokens);
 
     tokens = deepseek_v4_mtp_maybe_to_device(tokens, runtime_device);
     positions = deepseek_v4_mtp_maybe_to_device(positions, runtime_device);
+
+    auto mask = (positions == 0);
+    if (mask.any().item<bool>()) {
+      hidden_states.index_put_({mask},
+                               torch::zeros_like(hidden_states.index({mask})));
+    }
 
     auto modified_input_params = input_params;
     auto& dp_token_nums = modified_input_params.dp_global_token_nums;
@@ -359,13 +367,11 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
              static_cast<int32_t>(mtp_layers_.size()))
         << "deepseek_v4_mtp requires kv_caches size >= mtp layer count";
 
-    torch::Tensor hidden_states;
     for (size_t i = 0; i < mtp_layers_.size(); ++i) {
       const int32_t layer_id = mtp_start_layer_idx_ + static_cast<int32_t>(i);
       prepare_for_layer(attn_metadata, layer_id);
-      hidden_states = mtp_layers_[i](previous_hidden_states,
-                                     i == 0 ? previous_hidden_states
-                                            : hidden_states,
+      hidden_states = mtp_layers_[i](hidden_states,
+                                     previous_hidden_states,
                                      positions,
                                      attn_metadata,
                                      kv_caches[i],

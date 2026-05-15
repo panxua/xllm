@@ -25,6 +25,59 @@ namespace xllm::specBuilder {
 
 namespace {
 
+void fill_common_cpu_view(DecodeCpuView& view,
+                          const torch::Tensor& token_ids_cpu,
+                          const torch::Tensor& positions_cpu,
+                          const Slice<int32_t>& kv_seq_lens) {
+  view.token_ids_cpu = token_ids_cpu;
+  view.positions_cpu = positions_cpu;
+  if (view.token_ids_cpu.defined()) {
+    view.token_ids = {view.token_ids_cpu.data_ptr<int32_t>(),
+                      static_cast<size_t>(view.token_ids_cpu.numel())};
+  }
+  view.positions = {view.positions_cpu.data_ptr<int32_t>(),
+                    static_cast<size_t>(view.positions_cpu.numel())};
+  view.kv_seq_lens = kv_seq_lens;
+}
+
+void fill_standard_block_and_slot_view(DecodeCpuView& view,
+                                       const torch::Tensor& block_tables_cpu) {
+  view.block_tables_cpu = block_tables_cpu;
+  CHECK(view.block_tables_cpu.defined()) << "block_tables_cpu is undefined";
+  const int64_t num_sequences = view.block_tables_cpu.size(0);
+  view.block_table_slices.reserve(num_sequences);
+  for (int64_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+    torch::Tensor block_table = view.block_tables_cpu[seq_id];
+    view.block_table_slices.emplace_back(
+        block_table.data_ptr<int32_t>(),
+        static_cast<size_t>(block_table.numel()));
+  }
+}
+
+void fill_multi_block_and_slot_view(DecodeCpuView& view,
+                                    const ModelInputParams& params) {
+  view.model_managed_multiblock = !params.multi_block_tables.empty();
+  CHECK(view.model_managed_multiblock)
+      << "decode view requires block_tables or multi_block_tables";
+  view.multi_block_tables_cpu.reserve(params.multi_block_tables.size());
+  for (const auto& block_table : params.multi_block_tables) {
+    view.multi_block_tables_cpu.emplace_back(safe_to(block_table, torch::kCPU));
+  }
+  view.multi_block_table_slices.resize(view.multi_block_tables_cpu.size());
+  for (size_t m = 0; m < view.multi_block_tables_cpu.size(); ++m) {
+    CHECK(view.multi_block_tables_cpu[m].defined())
+        << "multi_block_tables_cpu[" << m << "] is undefined";
+    const int64_t num_sequences = view.multi_block_tables_cpu[m].size(0);
+    view.multi_block_table_slices[m].reserve(num_sequences);
+    for (int64_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+      torch::Tensor block_table = view.multi_block_tables_cpu[m][seq_id];
+      view.multi_block_table_slices[m].emplace_back(
+          block_table.data_ptr<int32_t>(),
+          static_cast<size_t>(block_table.numel()));
+    }
+  }
+}
+
 // Builds cumulative seq-lens layout: [0, l0, l0+l1, ...].
 void push_cumsum(std::vector<int32_t>& vec, int32_t len) {
   if (vec.empty()) {
@@ -48,27 +101,14 @@ int32_t resolve_row_token_id(const DecodeCpuView& view, const RowSpec& row) {
 
 DecodeCpuView make_decode_cpu_view(const torch::Tensor& token_ids_cpu,
                                    const torch::Tensor& positions_cpu,
-                                   const torch::Tensor& block_tables_cpu,
-                                   const Slice<int32_t>& kv_seq_lens_slice) {
+                                   const ModelInputParams& params) {
   DecodeCpuView view;
-  view.token_ids_cpu = token_ids_cpu;
-  view.positions_cpu = positions_cpu;
-  view.block_tables_cpu = block_tables_cpu;
-  if (view.token_ids_cpu.defined()) {
-    view.token_ids = {view.token_ids_cpu.data_ptr<int32_t>(),
-                      static_cast<size_t>(view.token_ids_cpu.numel())};
-  }
-  view.positions = {view.positions_cpu.data_ptr<int32_t>(),
-                    static_cast<size_t>(view.positions_cpu.numel())};
-  view.kv_seq_lens = kv_seq_lens_slice;
-  CHECK(view.block_tables_cpu.defined()) << "block_tables_cpu is undefined";
-  const int64_t num_sequences = view.block_tables_cpu.size(0);
-  view.block_table_slices.reserve(num_sequences);
-  for (int64_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    torch::Tensor block_table = view.block_tables_cpu[seq_id];
-    view.block_table_slices.emplace_back(
-        block_table.data_ptr<int32_t>(),
-        static_cast<size_t>(block_table.numel()));
+  fill_common_cpu_view(view, token_ids_cpu, positions_cpu, params.kv_seq_lens_vec);
+
+  if (params.block_tables.defined()) {
+    fill_standard_block_and_slot_view(view, params.block_tables);
+  } else {
+    fill_multi_block_and_slot_view(view, params);
   }
   return view;
 }
@@ -131,11 +171,8 @@ void append_decode_row(const ModelInputParams& params,
   CHECK_GE(row.seq_id, 0);
   CHECK_LT(row.seq_id, params.num_sequences);
   CHECK_LT(static_cast<size_t>(row.seq_id), view.positions.size());
-  CHECK_LT(static_cast<size_t>(row.seq_id), view.block_table_slices.size());
   const int32_t new_position = view.positions[row.seq_id] + row.position_offset;
   CHECK_GE(new_position, 0) << "invalid decode position";
-
-  const Slice<int32_t>& block_table_slice = view.block_table_slices[row.seq_id];
 
   // All decode paths can toggle which fields are emitted, so one row builder
   // can serve draft/validate/first-decode/update-last-step scenarios.
@@ -143,8 +180,35 @@ void append_decode_row(const ModelInputParams& params,
     buf.out_token_ids.emplace_back(resolve_row_token_id(view, row));
   }
   buf.out_positions.emplace_back(new_position);
-  buf.out_new_cache_slots.emplace_back(
-      calc_slot_id(new_position, block_table_slice, block_size));
+  if (view.model_managed_multiblock) {
+    // Multi-block DSA slot/block-table construction is delegated to model code
+    // for now. A later change may lift that ownership back into runtime.
+    buf.out_new_cache_slots.emplace_back(0);
+    if (row.append_block_table) {
+      if (buf.out_multi_block_tables.size() <
+          view.multi_block_table_slices.size()) {
+        buf.out_multi_block_tables.resize(view.multi_block_table_slices.size());
+      }
+      for (size_t m = 0; m < view.multi_block_table_slices.size(); ++m) {
+        CHECK_LT(static_cast<size_t>(row.seq_id),
+                 view.multi_block_table_slices[m].size());
+        const Slice<int32_t>& block_table_slice =
+            view.multi_block_table_slices[m][row.seq_id];
+        buf.out_multi_block_tables[m].emplace_back(block_table_slice.begin(),
+                                                   block_table_slice.end());
+      }
+    }
+  } else {
+    CHECK_LT(static_cast<size_t>(row.seq_id), view.block_table_slices.size());
+    const Slice<int32_t>& block_table_slice =
+        view.block_table_slices[row.seq_id];
+    buf.out_new_cache_slots.emplace_back(
+        calc_slot_id(new_position, block_table_slice, block_size));
+    if (row.append_block_table) {
+      buf.out_block_tables.emplace_back(block_table_slice.begin(),
+                                        block_table_slice.end());
+    }
+  }
 
   if (row.append_kv_len) {
     int32_t kv_len =
@@ -153,10 +217,6 @@ void append_decode_row(const ModelInputParams& params,
   }
   if (row.append_q_len_one) {
     append_seq_len_by_layout(buf.out_q_seq_lens, 1);
-  }
-  if (row.append_block_table) {
-    buf.out_block_tables.emplace_back(block_table_slice.begin(),
-                                      block_table_slice.end());
   }
 }
 

@@ -47,40 +47,6 @@ limitations under the License.
 
 namespace xllm {
 
-inline int64_t deepseek_v4_mtp_next_power_of_two(int64_t n) {
-  int64_t value = 1;
-  while (value < n) {
-    value <<= 1;
-  }
-  return value;
-}
-
-inline torch::Tensor deepseek_v4_mtp_create_hadamard_matrix(
-    int64_t n,
-    torch::ScalarType dtype,
-    const torch::Device& device) {
-  auto options = torch::TensorOptions().dtype(dtype).device(device);
-  torch::Tensor matrix = torch::ones({1, 1}, options);
-  for (int64_t m = 1; m < n; m <<= 1) {
-    auto top = torch::cat({matrix, matrix}, 1);
-    auto bottom = torch::cat({matrix, -matrix}, 1);
-    matrix = torch::cat({top, bottom}, 0);
-  }
-  return matrix;
-}
-
-inline torch::Tensor deepseek_v4_mtp_maybe_to_device(const torch::Tensor& tensor,
-                                                     const torch::Device& device) {
-  if (!tensor.defined() || tensor.device() == device) {
-    return tensor;
-  }
-  return tensor.to(device);
-}
-
-inline int32_t deepseek_v4_mtp_normalize_compress_ratio(int32_t ratio) {
-  return ratio <= 1 ? 1 : ratio;
-}
-
 class DeepseekV4MultiTokenPredictorLayerImpl
     : public MtpDecoderLayerImplBase<layer::DeepseekV4DecoderLayer> {
  public:
@@ -125,12 +91,7 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     CHECK_GE(model_args.num_nextn_predict_layers(), 0)
         << "deepseek_v4_mtp requires num_nextn_predict_layers >= 0";
 
-    const int32_t mtp_n_layers =
-        std::max<int32_t>(model_args.num_nextn_predict_layers(), 1);
-    CHECK_LE(mtp_n_layers, model_args.n_layers())
-        << "deepseek_v4_mtp requires num_nextn_predict_layers <= n_layers, got "
-        << mtp_n_layers << " vs " << model_args.n_layers();
-    mtp_start_layer_idx_ = model_args.n_layers() - mtp_n_layers;
+    const int32_t mtp_n_layers = model_args.n_layers();
 
     num_heads_ = model_args.n_heads();
     head_dim_ = model_args.o_lora_rank() + model_args.qk_rope_head_dim();
@@ -177,16 +138,16 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
 
     if (model_args.index_head_dim() > 0) {
       auto hadamard_dim_padded =
-          deepseek_v4_mtp_next_power_of_two(model_args.index_head_dim());
-      dsa_hadamard_ = deepseek_v4_mtp_create_hadamard_matrix(
+          deepseek_v4_next_power_of_two(model_args.index_head_dim());
+      dsa_hadamard_ = deepseek_v4_create_hadamard_matrix(
           hadamard_dim_padded, options.dtype().toScalarType(), options.device());
     }
 
-    build_cache_specs(context);
+    deepseek_v4_build_cache_specs(model_args, caches_info_, group_infos_);
 
     mtp_layers_.reserve(mtp_n_layers);
     for (int32_t i = 0; i < mtp_n_layers; ++i) {
-      const int32_t layer_index = mtp_start_layer_idx_ + i;
+      const int32_t layer_index = i;
       mtp_layers_.push_back(
           DeepseekV4MultiTokenPredictorLayer(context, layer_index));
       register_module("layer_" + std::to_string(i), mtp_layers_.back());
@@ -267,8 +228,8 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
 
     torch::Tensor hidden_states = embed_tokens_(tokens);
 
-    tokens = deepseek_v4_mtp_maybe_to_device(tokens, runtime_device);
-    positions = deepseek_v4_mtp_maybe_to_device(positions, runtime_device);
+    tokens = maybe_to_device(tokens, runtime_device);
+    positions = maybe_to_device(positions, runtime_device);
 
     auto mask = (positions == 0);
     if (mask.any().item<bool>()) {
@@ -280,20 +241,20 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     auto& dp_token_nums = modified_input_params.dp_global_token_nums;
     std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
 
-    auto attn_metadata = build_attention_metadata(modified_input_params, positions);
-    prepare_for_forward(attn_metadata, runtime_device);
+    modified_input_params.attn_metadata =
+        build_attention_metadata_for_forward(positions, modified_input_params);
 
     CHECK_GE(static_cast<int32_t>(kv_caches.size()),
              static_cast<int32_t>(mtp_layers_.size()))
         << "deepseek_v4_mtp requires kv_caches size >= mtp layer count";
 
     for (size_t i = 0; i < mtp_layers_.size(); ++i) {
-      const int32_t layer_id = mtp_start_layer_idx_ + static_cast<int32_t>(i);
-      prepare_for_layer(attn_metadata, layer_id);
+      const int32_t layer_id = static_cast<int32_t>(i);
+      prepare_for_layer(*modified_input_params.attn_metadata, layer_id);
       hidden_states = mtp_layers_[i](hidden_states,
                                      previous_hidden_states,
                                      positions,
-                                     attn_metadata,
+                                     *modified_input_params.attn_metadata,
                                      kv_caches[i],
                                      modified_input_params,
                                      tokens);
@@ -303,490 +264,24 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     return ModelOutput(output, std::nullopt);
   }
 
- private:
-  layer::AttentionMetadata build_attention_metadata(
-      const ModelInputParams& input_params,
-      const torch::Tensor& positions) const {
-    CHECK(!caches_info_.empty())
-        << "[DeepseekV4Mtp] caches_info must not be empty";
-    CHECK(!group_infos_.empty())
-        << "[DeepseekV4Mtp] group_infos must not be empty";
+  private:
+  std::shared_ptr<layer::AttentionMetadata>
+  build_attention_metadata_for_forward(const torch::Tensor& positions,
+                                       const ModelInputParams& input_params) {
+    auto modified_input_params = input_params;
+    auto& dp_token_nums = modified_input_params.dp_global_token_nums;
+    std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
 
-    auto attn_metadata = layer::AttentionMetadataBuilder::build(input_params);
-
-    auto dsa_metadata = std::make_shared<layer::DSAMetadata>();
-    build_dsa_fields(input_params, positions, *dsa_metadata);
-
-    if (attn_metadata.attn_mask.defined()) {
-      dsa_metadata->attn_mask = attn_metadata.attn_mask.clone();
+    auto attn_metadata = std::make_shared<layer::AttentionMetadata>(
+        layer::DSAMetadataBuilder::build(modified_input_params,
+                                         positions,
+                                         dsa_cos_sin_,
+                                         caches_info_,
+                                         group_infos_));
+    if (attn_metadata->dsa_metadata) {
+      prepare_for_forward(*attn_metadata, positions.device());
     }
-
-    if (attn_metadata.mrope_cos.defined() && !dsa_metadata->cos_table.defined()) {
-      dsa_metadata->cos_table = attn_metadata.mrope_cos;
-    }
-    if (attn_metadata.mrope_sin.defined() && !dsa_metadata->sin_table.defined()) {
-      dsa_metadata->sin_table = attn_metadata.mrope_sin;
-    }
-
-    attn_metadata.dsa_metadata = std::move(dsa_metadata);
-
     return attn_metadata;
-  }
-
-  void build_dsa_fields(const ModelInputParams& params,
-                        const torch::Tensor& positions,
-                        layer::DSAMetadata& dsa) const {
-    const int32_t batch_size =
-        static_cast<int32_t>(params.kv_seq_lens_vec.size());
-
-    dsa.input_positions = positions;
-
-    build_seq_lengths(params, batch_size, dsa);
-
-    if (dsa_cos_sin_.defined()) {
-      auto cos_sin_chunks = dsa_cos_sin_.chunk(/*chunks=*/2, /*dim=*/-1);
-      dsa.cos_table = cos_sin_chunks[0].contiguous();
-      dsa.sin_table = cos_sin_chunks[1].contiguous();
-    }
-
-    if (positions.defined()) {
-      const int64_t total_tokens = positions.numel();
-      build_positions(params, batch_size, total_tokens, dsa);
-    }
-
-    if (!params.multi_block_tables.empty() && !caches_info_.empty()) {
-      std::vector<torch::Tensor> active_multi_block_tables =
-          params.multi_block_tables;
-      int32_t manager_num =
-          static_cast<int32_t>(active_multi_block_tables.size());
-
-      CHECK_EQ(batch_size, static_cast<int32_t>(params.kv_seq_lens_vec.size()))
-          << "[DeepseekV4Mtp] batch_size mismatch with kv_seq_lens_vec size.";
-      CHECK_LE(manager_num, static_cast<int32_t>(group_infos_.size()))
-          << "[DeepseekV4Mtp] manager_num(" << manager_num
-          << ") exceeds group_infos size(" << group_infos_.size()
-          << "), cannot align manager/group mapping.";
-      const int32_t n_layers = static_cast<int32_t>(caches_info_.size());
-      const auto& ctx_lens = params.kv_seq_lens_vec;
-      int64_t total_tokens = 0;
-      for (auto len : ctx_lens) total_tokens += len;
-
-      std::vector<torch::Tensor> mgr_slots(manager_num);
-      for (int32_t m = 0; m < manager_num; ++m) {
-        mgr_slots[m] = expand_blocks_to_slots(active_multi_block_tables[m],
-                                              group_infos_[m],
-                                              ctx_lens,
-                                              batch_size,
-                                              total_tokens);
-      }
-
-      std::vector<torch::Tensor> proc_slots(manager_num);
-      std::vector<torch::Tensor> proc_bt(manager_num);
-      for (int32_t m = 0; m < manager_num; ++m) {
-        process_group(active_multi_block_tables[m],
-                      mgr_slots[m],
-                      group_infos_[m],
-                      ctx_lens,
-                      params.q_seq_lens_vec,
-                      batch_size,
-                      total_tokens,
-                      proc_bt[m],
-                      proc_slots[m]);
-      }
-
-      const torch::Device target_device =
-          positions.defined() ? positions.device() : torch::Device(torch::kCPU);
-      if (!target_device.is_cpu()) {
-        for (int32_t m = 0; m < manager_num; ++m) {
-          if (proc_bt[m].defined() && proc_bt[m].device() != target_device) {
-            proc_bt[m] = proc_bt[m].to(target_device);
-          }
-          if (proc_slots[m].defined() &&
-              proc_slots[m].device() != target_device) {
-            proc_slots[m] = proc_slots[m].to(target_device);
-          }
-        }
-      }
-
-      dsa.block_tables.resize(n_layers);
-      dsa.slot_mappings.resize(n_layers);
-      for (int32_t lid = 0; lid < n_layers; ++lid) {
-        const auto& lci = caches_info_[lid];
-        dsa.block_tables[lid].resize(lci.size());
-        dsa.slot_mappings[lid].resize(lci.size());
-        for (size_t ci = 0; ci < lci.size(); ++ci) {
-          int32_t gid = lci[ci].group_id;
-          if (gid < manager_num) {
-            dsa.block_tables[lid][ci] = proc_bt[gid];
-            dsa.slot_mappings[lid][ci] = proc_slots[gid];
-          }
-        }
-      }
-    }
-
-    dsa.caches_info = &caches_info_;
-  }
-
-  static torch::Tensor expand_blocks_to_slots(
-      const torch::Tensor& block_table,
-      const DSAGroupInfo& gi,
-      const std::vector<int>& ctx_lens,
-      int32_t batch_size,
-      int64_t total_tokens) {
-    const int32_t bs = gi.block_size;
-    auto slots = torch::full({total_tokens}, -1, torch::kInt32);
-    auto slots_acc = slots.accessor<int32_t, 1>();
-    auto bt_acc = block_table.accessor<int32_t, 2>();
-    const int32_t max_blocks = block_table.size(1);
-
-    int64_t start_idx = 0;
-    for (int32_t seq = 0; seq < batch_size; ++seq) {
-      int64_t token_len = ctx_lens[seq];
-      int64_t slot_num = compute_slot_num(gi, token_len);
-
-      int64_t filled = 0;
-      for (int32_t blk = 0; blk < max_blocks && filled < slot_num; ++blk) {
-        int32_t block_id = bt_acc[seq][blk];
-        if (block_id < 0) break;
-        for (int32_t off = 0; off < bs && filled < slot_num; ++off) {
-          slots_acc[start_idx + filled] =
-              static_cast<int32_t>(static_cast<int64_t>(block_id) * bs + off);
-          ++filled;
-        }
-      }
-      start_idx += token_len;
-    }
-    return slots;
-  }
-
-  static int64_t compute_slot_num(const DSAGroupInfo& gi, int64_t token_len) {
-    if (gi.type == DSACacheType::TOKEN) {
-      return token_len / gi.ratio;
-    }
-    const int32_t bs = gi.block_size;
-    if (token_len > bs) {
-      return token_len % bs + bs;
-    }
-    int64_t n = token_len % bs;
-    return (n == 0 && token_len > 0) ? bs : n;
-  }
-
-  static void process_group(const torch::Tensor& raw_bt,
-                           const torch::Tensor& raw_slots,
-                           const DSAGroupInfo& gi,
-                           const std::vector<int>& ctx_lens,
-                           const std::vector<int>& q_lens_vec,
-                           int32_t batch_size,
-                           int64_t total_tokens,
-                           torch::Tensor& out_bt,
-                           torch::Tensor& out_slots) {
-    std::vector<int> q_lens;
-    if (static_cast<int32_t>(q_lens_vec.size()) == batch_size) {
-      q_lens = q_lens_vec;
-    } else {
-      q_lens.assign(batch_size, 1);
-    }
-
-    if (gi.type == DSACacheType::TOKEN) {
-      process_token_group(raw_bt, raw_slots, gi.ratio, ctx_lens, q_lens,
-                          batch_size, total_tokens, out_bt, out_slots);
-    } else if (gi.type == DSACacheType::SLIDING_WINDOW) {
-      process_swa_group(raw_bt, raw_slots, gi.block_size, ctx_lens, q_lens,
-                        batch_size, out_bt, out_slots);
-    } else {
-      out_slots =
-          torch::where(raw_slots.eq(-1), torch::zeros_like(raw_slots), raw_slots);
-      out_bt = raw_bt;
-    }
-  }
-
-  static void process_token_group(const torch::Tensor& raw_bt,
-                                 const torch::Tensor& raw_slots,
-                                 int32_t ratio,
-                                 const std::vector<int>& ctx_lens,
-                                 const std::vector<int>& q_lens,
-                                 int32_t batch_size,
-                                 int64_t total_tokens,
-                                 torch::Tensor& out_bt,
-                                 torch::Tensor& out_slots) {
-    int64_t committed_rows = 0;
-    for (int32_t seq = 0; seq < batch_size; ++seq) {
-      const int64_t ctx_len = static_cast<int64_t>(ctx_lens[seq]);
-      const int64_t q_len =
-          std::clamp<int64_t>(static_cast<int64_t>(q_lens[seq]), 0, ctx_len);
-      const int64_t prev_ctx_len = ctx_len - q_len;
-      committed_rows += ctx_len / ratio - prev_ctx_len / ratio;
-    }
-
-    auto out_slots_tensor = torch::empty({committed_rows}, raw_slots.options());
-    auto out_slots_acc = out_slots_tensor.accessor<int32_t, 1>();
-    auto raw_slots_acc = raw_slots.accessor<int32_t, 1>();
-
-    int64_t start_idx = 0;
-    int64_t write_idx = 0;
-    for (int32_t seq = 0; seq < batch_size; ++seq) {
-      const int64_t ctx_len = static_cast<int64_t>(ctx_lens[seq]);
-      const int64_t q_len =
-          std::clamp<int64_t>(static_cast<int64_t>(q_lens[seq]), 0, ctx_len);
-      const int64_t prev_ctx_len = ctx_len - q_len;
-      const int64_t prev_committed = prev_ctx_len / ratio;
-      const int64_t committed = ctx_len / ratio;
-      const int64_t new_committed = committed - prev_committed;
-      for (int64_t i = 0; i < new_committed; ++i) {
-        out_slots_acc[write_idx++] =
-            raw_slots_acc[start_idx + prev_committed + i];
-      }
-      start_idx += ctx_len;
-    }
-
-    out_slots = out_slots_tensor;
-    out_bt = raw_bt;
-  }
-
-  static void process_swa_group(const torch::Tensor& raw_bt,
-                               const torch::Tensor& raw_slots,
-                               int32_t block_size,
-                               const std::vector<int>& ctx_lens,
-                               const std::vector<int>& q_lens,
-                               int32_t batch_size,
-                               torch::Tensor& out_bt,
-                               torch::Tensor& out_slots) {
-    int64_t query_total_tokens = 0;
-    for (int32_t seq = 0; seq < batch_size; ++seq) {
-      query_total_tokens += std::clamp<int64_t>(
-          static_cast<int64_t>(q_lens[seq]), 0, ctx_lens[seq]);
-    }
-
-    auto out_slots_tensor =
-        torch::full({query_total_tokens}, -1, raw_slots.options());
-    auto out_slots_acc = out_slots_tensor.accessor<int32_t, 1>();
-    auto raw_bt_acc = raw_bt.accessor<int32_t, 2>();
-    const int64_t max_blocks = raw_bt.size(1);
-    const int64_t block_size_i64 = static_cast<int64_t>(block_size);
-
-    auto slot_for_position = [&](int32_t seq, int64_t pos) -> int32_t {
-      if (max_blocks <= 0) {
-        return -1;
-      }
-      const int64_t block_idx = (pos / block_size_i64) % max_blocks;
-      const int32_t block_id = raw_bt_acc[seq][block_idx];
-      if (block_id < 0) {
-        return -1;
-      }
-      const int64_t block_offset = pos % block_size_i64;
-      return static_cast<int32_t>(
-          static_cast<int64_t>(block_id) * block_size_i64 + block_offset);
-    };
-
-    int64_t write_idx = 0;
-    for (int32_t seq = 0; seq < batch_size; ++seq) {
-      const int64_t ctx_len = static_cast<int64_t>(ctx_lens[seq]);
-      const int64_t q_len =
-          std::clamp<int64_t>(static_cast<int64_t>(q_lens[seq]), 0, ctx_len);
-      const int64_t q_start = ctx_len - q_len;
-      for (int64_t i = 0; i < q_len; ++i) {
-        out_slots_acc[write_idx++] = slot_for_position(seq, q_start + i);
-      }
-    }
-
-    out_slots = out_slots_tensor;
-
-    int32_t current_cols = raw_bt.size(1);
-    int32_t max_dst_len = 0;
-    std::vector<int32_t> dst_lens(batch_size);
-    for (int32_t s = 0; s < batch_size; ++s) {
-      dst_lens[s] = static_cast<int32_t>(
-          std::ceil(static_cast<double>(ctx_lens[s]) / block_size));
-      max_dst_len = std::max(max_dst_len, dst_lens[s]);
-    }
-    max_dst_len = std::max(max_dst_len, current_cols);
-
-    auto new_bt = torch::zeros({batch_size, max_dst_len}, raw_bt.options());
-    auto new_acc = new_bt.accessor<int32_t, 2>();
-    auto old_acc = raw_bt.accessor<int32_t, 2>();
-
-    for (int32_t s = 0; s < batch_size; ++s) {
-      const int32_t retained_cols = std::min(current_cols, dst_lens[s]);
-      const int32_t start_col = dst_lens[s] - retained_cols;
-      for (int32_t j = 0; j < retained_cols; ++j) {
-        const int32_t logical_col = start_col + j;
-        const int32_t physical_col = logical_col % current_cols;
-        new_acc[s][logical_col] = old_acc[s][physical_col];
-      }
-    }
-    out_bt = new_bt;
-  }
-
-  static void build_seq_lengths(const ModelInputParams& params,
-                                int32_t batch_size,
-                                layer::DSAMetadata& dsa_metadata) {
-    auto kv_lens =
-        torch::tensor(std::vector<int32_t>(params.kv_seq_lens_vec.begin(),
-                                           params.kv_seq_lens_vec.end()),
-                      torch::kInt32);
-    dsa_metadata.seq_lens = kv_lens;
-    dsa_metadata.actual_seq_lengths_kv = kv_lens;
-
-    torch::Tensor q_lens;
-    if (static_cast<int32_t>(params.q_seq_lens_vec.size()) == batch_size) {
-      q_lens = torch::tensor(std::vector<int32_t>(params.q_seq_lens_vec.begin(),
-                                                  params.q_seq_lens_vec.end()),
-                             torch::kInt32);
-    } else if (params.batch_forward_type.no_decode()) {
-      q_lens = kv_lens;
-    } else {
-      q_lens = torch::ones({batch_size}, torch::kInt32);
-    }
-
-    auto cumsum = torch::cumsum(q_lens, /*dim=*/0, /*dtype=*/torch::kInt32);
-    dsa_metadata.actual_seq_lengths_query =
-        torch::cat({torch::zeros({1}, torch::kInt32), cumsum});
-    dsa_metadata.seq_lens_q = q_lens;
-
-    auto int_options = torch::TensorOptions().dtype(torch::kInt32);
-    if (kv_lens.numel() > 0) {
-      dsa_metadata.max_seqlen_kv = torch::max(kv_lens).to(torch::kInt32);
-    } else {
-      dsa_metadata.max_seqlen_kv = torch::zeros({1}, int_options);
-    }
-
-    if (q_lens.numel() > 0) {
-      dsa_metadata.max_seqlen_q = torch::max(q_lens).to(torch::kInt32);
-    } else {
-      dsa_metadata.max_seqlen_q = torch::zeros({1}, int_options);
-    }
-  }
-
-  static void build_positions(const ModelInputParams& params,
-                              int32_t batch_size,
-                              int64_t total_tokens,
-                              layer::DSAMetadata& dsa_metadata) {
-    (void)params;
-    (void)total_tokens;
-    if (!dsa_metadata.input_positions.defined()) return;
-
-    auto input_positions = dsa_metadata.input_positions;
-    int64_t num_tokens = input_positions.size(0);
-
-    auto c4_mask = ((input_positions + 1) % 4).eq(0);
-    auto c4_pos = input_positions.index({c4_mask});
-    c4_pos = (c4_pos + 1) - 4;
-    int64_t c4_target = std::min(num_tokens, num_tokens / 4 + batch_size);
-    int64_t c4_pad_right = c4_target - c4_pos.size(0);
-    if (c4_pad_right > 0) {
-      dsa_metadata.c4_pad_positions =
-          torch::cat({c4_pos, torch::zeros({c4_pad_right}, c4_pos.options())});
-    } else {
-      dsa_metadata.c4_pad_positions = c4_pos.slice(0, 0, c4_target);
-    }
-
-    auto c128_mask = ((input_positions + 1) % 128).eq(0);
-    auto c128_pos = input_positions.index({c128_mask});
-    c128_pos = (c128_pos + 1) - 128;
-    int64_t c128_target = std::min(num_tokens, num_tokens / 128 + batch_size);
-    int64_t c128_pad_right = c128_target - c128_pos.size(0);
-    if (c128_pad_right > 0) {
-      dsa_metadata.c128_pad_positions = torch::cat(
-          {c128_pos, torch::zeros({c128_pad_right}, c128_pos.options())});
-    } else {
-      dsa_metadata.c128_pad_positions = c128_pos.slice(0, 0, c128_target);
-    }
-  }
-
-  void build_cache_specs(const ModelContext& context) {
-    const auto& model_args = context.get_model_args();
-    const auto& compress_ratios = model_args.compress_ratios();
-    const int32_t window_size = model_args.window_size();
-    const int32_t base_block_size = 128;
-
-    struct DSAGroupKey {
-      int32_t ratio;
-      DSACacheType type;
-      int32_t block_size;
-      bool operator==(const DSAGroupKey& o) const {
-        return ratio == o.ratio && type == o.type && block_size == o.block_size;
-      }
-    };
-
-    struct DSAGroupKeyHash {
-      size_t operator()(const DSAGroupKey& k) const {
-        size_t h = std::hash<int32_t>()(k.ratio);
-        h ^= std::hash<int32_t>()(static_cast<int32_t>(k.type)) << 16;
-        h ^= std::hash<int32_t>()(k.block_size) << 8;
-        return h;
-      }
-    };
-
-    std::unordered_map<DSAGroupKey, int32_t, DSAGroupKeyHash> group_key_map;
-    auto register_group = [&](DSACacheType type, int32_t ratio,
-                              int32_t block_size) -> int32_t {
-      DSAGroupKey key{ratio, type, block_size};
-      auto it = group_key_map.find(key);
-      if (it != group_key_map.end()) {
-        return it->second;
-      }
-      const int32_t gid = static_cast<int32_t>(group_infos_.size());
-      group_key_map.emplace(key, gid);
-      group_infos_.push_back({type, ratio, block_size});
-      return gid;
-    };
-
-    register_group(DSACacheType::SLIDING_WINDOW, 1, window_size);
-    for (const auto ratio : compress_ratios) {
-      const int32_t cr = deepseek_v4_mtp_normalize_compress_ratio(ratio);
-      if (cr == 4 || cr == 128) {
-        register_group(DSACacheType::TOKEN, cr, base_block_size);
-      }
-    }
-
-    caches_info_.resize(model_args.n_layers());
-
-    for (int32_t layer_id = 0; layer_id < model_args.n_layers(); ++layer_id) {
-      int32_t cr = (layer_id < static_cast<int32_t>(compress_ratios.size()))
-                        ? compress_ratios[layer_id]
-                        : 1;
-      cr = deepseek_v4_mtp_normalize_compress_ratio(cr);
-
-      struct CacheEntry {
-        DSACacheType type;
-        int32_t ratio;
-        int32_t block_size;
-      };
-      std::vector<CacheEntry> layer_caches;
-
-      if (cr == 1) {
-        layer_caches.push_back(
-            {DSACacheType::SLIDING_WINDOW, 1, window_size});
-      } else if (cr == 4) {
-        layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
-        layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
-        layer_caches.push_back(
-            {DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back(
-            {DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back(
-            {DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back(
-            {DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back(
-            {DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
-      } else if (cr == 128) {
-        layer_caches.push_back(
-            {DSACacheType::TOKEN, 128, base_block_size});
-        layer_caches.push_back(
-            {DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back(
-            {DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back(
-            {DSACacheType::SLIDING_WINDOW, 1, window_size});
-      }
-
-      for (const auto& ce : layer_caches) {
-        const int32_t gid = register_group(ce.type, ce.ratio, ce.block_size);
-        caches_info_[layer_id].push_back({gid, ce.type, ce.ratio, ce.block_size});
-      }
-    }
   }
 
   void prepare_for_forward(layer::AttentionMetadata& attn_metadata,
@@ -796,37 +291,37 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
 
     auto& dsa = *(attn_metadata.dsa_metadata);
 
-    dsa.seq_lens = deepseek_v4_mtp_maybe_to_device(dsa.seq_lens, runtime_device);
+    dsa.seq_lens = maybe_to_device(dsa.seq_lens, runtime_device);
     dsa.seq_lens_q =
-        deepseek_v4_mtp_maybe_to_device(dsa.seq_lens_q, runtime_device);
+        maybe_to_device(dsa.seq_lens_q, runtime_device);
     dsa.actual_seq_lengths_query =
-        deepseek_v4_mtp_maybe_to_device(dsa.actual_seq_lengths_query, runtime_device);
+        maybe_to_device(dsa.actual_seq_lengths_query, runtime_device);
     dsa.actual_seq_lengths_kv =
-        deepseek_v4_mtp_maybe_to_device(dsa.actual_seq_lengths_kv, runtime_device);
+        maybe_to_device(dsa.actual_seq_lengths_kv, runtime_device);
     dsa.max_seqlen_q =
-        deepseek_v4_mtp_maybe_to_device(dsa.max_seqlen_q, runtime_device);
+        maybe_to_device(dsa.max_seqlen_q, runtime_device);
     dsa.max_seqlen_kv =
-        deepseek_v4_mtp_maybe_to_device(dsa.max_seqlen_kv, runtime_device);
+        maybe_to_device(dsa.max_seqlen_kv, runtime_device);
     dsa.input_positions =
-        deepseek_v4_mtp_maybe_to_device(dsa.input_positions, runtime_device);
+        maybe_to_device(dsa.input_positions, runtime_device);
     dsa.c4_pad_positions =
-        deepseek_v4_mtp_maybe_to_device(dsa.c4_pad_positions, runtime_device);
+        maybe_to_device(dsa.c4_pad_positions, runtime_device);
     dsa.c128_pad_positions =
-        deepseek_v4_mtp_maybe_to_device(dsa.c128_pad_positions, runtime_device);
+        maybe_to_device(dsa.c128_pad_positions, runtime_device);
 
     for (auto& layer_block_tables : dsa.block_tables) {
       for (auto& block_table : layer_block_tables) {
-        block_table = deepseek_v4_mtp_maybe_to_device(block_table, runtime_device);
+        block_table = maybe_to_device(block_table, runtime_device);
       }
     }
     for (auto& layer_slot_mappings : dsa.slot_mappings) {
       for (auto& slot_mapping : layer_slot_mappings) {
-        slot_mapping = deepseek_v4_mtp_maybe_to_device(slot_mapping, runtime_device);
+        slot_mapping = maybe_to_device(slot_mapping, runtime_device);
       }
     }
 
     if (dsa_hadamard_.defined()) {
-      dsa.hadamard = deepseek_v4_mtp_maybe_to_device(dsa_hadamard_, runtime_device);
+      dsa.hadamard = maybe_to_device(dsa_hadamard_, runtime_device);
     }
 
     build_rope(dsa, runtime_device);
@@ -852,6 +347,10 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     dsa.c4_sin = torch::Tensor();
     dsa.c128_cos = torch::Tensor();
     dsa.c128_sin = torch::Tensor();
+    dsa.c4_input_cos = torch::Tensor();
+    dsa.c4_input_sin = torch::Tensor();
+    dsa.c128_input_cos = torch::Tensor();
+    dsa.c128_input_sin = torch::Tensor();
 
     auto append_group_positions = [&positions_map](const std::string& group,
                                                    const torch::Tensor& positions) {
@@ -868,9 +367,6 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     append_group_positions("default", dsa.input_positions);
     append_group_positions("c4", dsa.c4_pad_positions);
     append_group_positions("c128", dsa.c128_pad_positions);
-
-    LOG(INFO) << "dsa.input_positions: " << dsa.input_positions;
-    LOG(INFO) << "positions_map: " << positions_map["default"];
 
     if (!positions_map.empty()) {
       auto group_cos_sin = dsa_rotary_embedding_->build(positions_map);
@@ -894,14 +390,33 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
       }
     }
 
-    dsa.cos = deepseek_v4_mtp_maybe_to_device(dsa.cos, runtime_device);
-    dsa.sin = deepseek_v4_mtp_maybe_to_device(dsa.sin, runtime_device);
-    dsa.c4_cos = deepseek_v4_mtp_maybe_to_device(dsa.c4_cos, runtime_device);
-    dsa.c4_sin = deepseek_v4_mtp_maybe_to_device(dsa.c4_sin, runtime_device);
+    dsa.cos = maybe_to_device(dsa.cos, runtime_device);
+    dsa.sin = maybe_to_device(dsa.sin, runtime_device);
+    dsa.c4_cos = maybe_to_device(dsa.c4_cos, runtime_device);
+    dsa.c4_sin = maybe_to_device(dsa.c4_sin, runtime_device);
     dsa.c128_cos =
-        deepseek_v4_mtp_maybe_to_device(dsa.c128_cos, runtime_device);
+        maybe_to_device(dsa.c128_cos, runtime_device);
     dsa.c128_sin =
-        deepseek_v4_mtp_maybe_to_device(dsa.c128_sin, runtime_device);
+        maybe_to_device(dsa.c128_sin, runtime_device);
+
+    if (dsa.input_positions.defined() && dsa.input_positions.numel() > 0) {
+      auto input_positions = dsa.input_positions;
+      if (input_positions.scalar_type() != torch::kInt64) {
+        input_positions = input_positions.to(torch::kInt64);
+      }
+      auto input_group_cos_sin = dsa_rotary_embedding_->build(
+          {{"c4", input_positions}, {"c128", input_positions}});
+      auto c4_input_it = input_group_cos_sin.find("c4");
+      if (c4_input_it != input_group_cos_sin.end()) {
+        dsa.c4_input_cos = c4_input_it->second.first;
+        dsa.c4_input_sin = c4_input_it->second.second;
+      }
+      auto c128_input_it = input_group_cos_sin.find("c128");
+      if (c128_input_it != input_group_cos_sin.end()) {
+        dsa.c128_input_cos = c128_input_it->second.first;
+        dsa.c128_input_sin = c128_input_it->second.second;
+      }
+    }
   }
 
   void build_precomputed_metadata(layer::DSAMetadata& dsa) const {
@@ -920,17 +435,17 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     }
 
     dsa.actual_seq_lengths_query =
-        deepseek_v4_mtp_maybe_to_device(dsa.actual_seq_lengths_query, metadata_device);
+        maybe_to_device(dsa.actual_seq_lengths_query, metadata_device);
     dsa.actual_seq_lengths_kv =
-        deepseek_v4_mtp_maybe_to_device(dsa.actual_seq_lengths_kv, metadata_device);
+        maybe_to_device(dsa.actual_seq_lengths_kv, metadata_device);
     dsa.seq_lens_q =
-        deepseek_v4_mtp_maybe_to_device(dsa.seq_lens_q, metadata_device);
+        maybe_to_device(dsa.seq_lens_q, metadata_device);
     dsa.seq_lens =
-        deepseek_v4_mtp_maybe_to_device(dsa.seq_lens, metadata_device);
+        maybe_to_device(dsa.seq_lens, metadata_device);
     dsa.max_seqlen_q =
-        deepseek_v4_mtp_maybe_to_device(dsa.max_seqlen_q, metadata_device);
+        maybe_to_device(dsa.max_seqlen_q, metadata_device);
     dsa.max_seqlen_kv =
-        deepseek_v4_mtp_maybe_to_device(dsa.max_seqlen_kv, metadata_device);
+        maybe_to_device(dsa.max_seqlen_kv, metadata_device);
 
     if (!dsa.actual_seq_lengths_query.defined() ||
         !dsa.actual_seq_lengths_kv.defined()) {
@@ -1131,7 +646,7 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
     dsa.layer_id = layer_id;
 
     const int32_t layer_compress_ratio =
-        deepseek_v4_mtp_normalize_compress_ratio(
+        deepseek_v4_normalize_compress_ratio(
             (layer_id <
              static_cast<int32_t>(model_args_->compress_ratios().size()))
                 ? model_args_->compress_ratios()[static_cast<size_t>(layer_id)]
@@ -1196,7 +711,6 @@ class DeepseekV4MtpModelImpl : public torch::nn::Module {
   layer::RMSNorm final_norm_{nullptr};
   layer::WordEmbedding embed_tokens_{nullptr};
   std::vector<DeepseekV4MultiTokenPredictorLayer> mtp_layers_;
-  int32_t mtp_start_layer_idx_ = 0;
 };
 TORCH_MODULE(DeepseekV4MtpModel);
 

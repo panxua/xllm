@@ -1,4 +1,4 @@
-﻿/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+﻿﻿﻿﻿﻿﻿/* Copyright 2026 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -497,8 +497,6 @@ void MTPWorkerImpl::build_decode_step_view(
   torch::Tensor positions_cpu = safe_to(input.positions, torch::kCPU);
   Slice<int32_t> input_token_ids = {token_ids_cpu.data_ptr<int32_t>(),
                                     static_cast<size_t>(token_ids_cpu.numel())};
-  decode_view.block_tables_cpu =
-      safe_to(input.input_params.block_tables, torch::kCPU);
   Slice<int32_t> input_positions = {positions_cpu.data_ptr<int32_t>(),
                                     static_cast<size_t>(positions_cpu.numel())};
 
@@ -533,17 +531,47 @@ void MTPWorkerImpl::build_decode_step_view(
                                           current_kv_len);
   }
 
-  decode_view.block_tables_cpu = decode_view.block_tables_cpu.contiguous();
-  decode_view.block_tables_data = {
-      decode_view.block_tables_cpu.data_ptr<int32_t>(),
-      static_cast<size_t>(decode_view.block_tables_cpu.numel())};
-  CHECK_EQ(decode_view.block_tables_cpu.dim(), 2)
-      << "decode context block tables must be 2D, got "
-      << decode_view.block_tables_cpu.sizes();
-  decode_view.num_sequences =
-      static_cast<int32_t>(decode_view.block_tables_cpu.size(0));
-  decode_view.block_table_row_stride =
-      static_cast<int32_t>(decode_view.block_tables_cpu.size(1));
+  if (input.input_params.block_tables.defined()) {
+    decode_view.block_tables_cpu =
+        safe_to(input.input_params.block_tables, torch::kCPU).contiguous();
+    CHECK_EQ(decode_view.block_tables_cpu.dim(), 2)
+        << "decode context block tables must be 2D, got "
+        << decode_view.block_tables_cpu.sizes();
+    const int64_t num_block_table_rows = decode_view.block_tables_cpu.size(0);
+    decode_view.block_table_slices.reserve(num_block_table_rows);
+    for (int64_t seq_id = 0; seq_id < num_block_table_rows; ++seq_id) {
+      torch::Tensor block_table = decode_view.block_tables_cpu[seq_id];
+      decode_view.block_table_slices.emplace_back(
+          block_table.data_ptr<int32_t>(),
+          static_cast<size_t>(block_table.numel()));
+    }
+  } else {
+    decode_view.model_managed_multiblock =
+        !input.input_params.multi_block_tables.empty();
+    decode_view.multi_block_tables_cpu.reserve(
+        input.input_params.multi_block_tables.size());
+    for (const torch::Tensor& block_table :
+         input.input_params.multi_block_tables) {
+      decode_view.multi_block_tables_cpu.emplace_back(
+          safe_to(block_table, torch::kCPU).contiguous());
+    }
+    decode_view.multi_block_table_slices.resize(
+        decode_view.multi_block_tables_cpu.size());
+    for (size_t m = 0; m < decode_view.multi_block_tables_cpu.size(); ++m) {
+      CHECK_EQ(decode_view.multi_block_tables_cpu[m].dim(), 2)
+          << "decode context multi_block_tables[" << m << "] must be 2D, got "
+          << decode_view.multi_block_tables_cpu[m].sizes();
+      const int64_t num_block_table_rows =
+          decode_view.multi_block_tables_cpu[m].size(0);
+      decode_view.multi_block_table_slices[m].reserve(num_block_table_rows);
+      for (int64_t seq_id = 0; seq_id < num_block_table_rows; ++seq_id) {
+        torch::Tensor block_table = decode_view.multi_block_tables_cpu[m][seq_id];
+        decode_view.multi_block_table_slices[m].emplace_back(
+            block_table.data_ptr<int32_t>(),
+            static_cast<size_t>(block_table.numel()));
+      }
+    }
+  }
   decode_view.token_ids = decode_view.token_ids_vec;
   decode_view.positions = decode_view.positions_vec;
   decode_view.kv_seq_lens = decode_view.kv_seq_lens_vec;
@@ -665,138 +693,6 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   torch::TensorOptions int_options = extend_input.token_ids.options();
   const specBuilder::DecodeCpuView& view = decode_view;
 
-  if (!input_params.multi_block_tables.empty() &&
-      !input_params.block_tables.defined()) {
-    specBuilder::DecodeBuildBuffers buf;
-    buf.out_token_ids.reserve(num_sequences * 2);
-    buf.out_positions.reserve(num_sequences * 2);
-    buf.out_kv_seq_lens.reserve(num_sequences * 2);
-    buf.out_q_seq_lens.reserve(num_sequences * 2);
-    std::vector<std::vector<std::vector<int32_t>>> expanded_multi_block_tables(
-        input_params.multi_block_tables.size());
-    for (std::vector<std::vector<int32_t>>& manager_tables :
-         expanded_multi_block_tables) {
-      manager_tables.reserve(num_sequences * 2);
-    }
-    std::vector<torch::Tensor> expanded_embeddings;
-    std::vector<int32_t> selected_row_idx;
-    expanded_embeddings.reserve(num_sequences * 2);
-    selected_row_idx.reserve(num_sequences);
-
-    std::vector<torch::Tensor> multi_block_tables_cpu;
-    multi_block_tables_cpu.reserve(input_params.multi_block_tables.size());
-    for (const torch::Tensor& block_table : input_params.multi_block_tables) {
-      multi_block_tables_cpu.emplace_back(safe_to(block_table, torch::kCPU));
-    }
-
-    torch::Tensor placeholder = embedding_cache_->embedding_placeholder();
-    CHECK(placeholder.defined())
-        << "embedding placeholder must be initialized for fake draft context";
-    placeholder = placeholder.to(device_);
-
-    for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-      auto add_row = [&](int32_t token_id,
-                         int32_t position_offset,
-                         const torch::Tensor& embedding) {
-        specBuilder::RowSpec row;
-        row.seq_id = seq_id;
-        row.token_id = token_id >= 0 ? token_id : 0;
-        row.position_offset = position_offset;
-        row.append_q_len_one = true;
-        row.append_block_table = false;
-        specBuilder::append_decode_row(view, row, block_size, buf);
-        for (size_t m = 0; m < multi_block_tables_cpu.size(); ++m) {
-          CHECK(multi_block_tables_cpu[m].defined())
-              << "multi_block_tables[" << m << "] is undefined";
-          CHECK_LT(seq_id, multi_block_tables_cpu[m].size(0))
-              << "seq_id out of range for multi_block_tables[" << m << "]";
-          torch::Tensor table_row = multi_block_tables_cpu[m][seq_id];
-          Slice<int32_t> table_row_slice = {
-              table_row.data_ptr<int32_t>(),
-              static_cast<size_t>(table_row.numel())};
-          expanded_multi_block_tables[m].emplace_back(table_row_slice.begin(),
-                                                       table_row_slice.end());
-        }
-        if (embedding.defined()) {
-          expanded_embeddings.emplace_back(embedding.to(device_));
-        } else {
-          expanded_embeddings.emplace_back(placeholder);
-        }
-      };
-
-      EmbeddingCache::DecodeState state = last_states[seq_id];
-      const int32_t current_token_id = view.token_ids[seq_id];
-      if (!state.valid || state.token_id != current_token_id) {
-        state = EmbeddingCache::DecodeState();
-        state.token_id = current_token_id >= 0 ? current_token_id : 0;
-      }
-      const bool use_two_rows = dp_enabled || state.all_draft_accepted;
-      if (use_two_rows) {
-        int32_t prev_token_id = state.prev_token_id;
-        int32_t prev_position_offset = -1;
-        torch::Tensor prev_embedding = state.prev_embedding;
-        if (prev_token_id < 0) {
-          prev_token_id = state.token_id;
-          prev_embedding = torch::Tensor();
-        }
-        add_row(prev_token_id, prev_position_offset, prev_embedding);
-      }
-
-      selected_row_idx.emplace_back(
-          static_cast<int32_t>(expanded_embeddings.size()));
-      add_row(state.token_id, /*position_offset=*/0, state.embedding);
-    }
-
-    CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_positions.size())
-        << "draft extend slots/positions mismatch";
-    CHECK_EQ(expanded_embeddings.size(), buf.out_positions.size())
-        << "draft extend embeddings/positions mismatch";
-
-    extend_input.token_ids = torch::tensor(buf.out_token_ids, int_options);
-    extend_input.positions = torch::tensor(buf.out_positions, int_options);
-    input_params.num_sequences = static_cast<int32_t>(buf.out_positions.size());
-    input_params.batch_forward_type = BatchForwardType::DECODE;
-    specBuilder::update_input_params(input_params,
-                                     buf,
-                                     int_options,
-                                     1,
-                                     std::move(buf.out_q_seq_lens),
-                                     buf.kv_max_seq_len,
-                                     std::move(buf.out_kv_seq_lens));
-    input_params.multi_block_tables.clear();
-    input_params.multi_block_tables.reserve(expanded_multi_block_tables.size());
-    for (std::vector<std::vector<int32_t>>& manager_tables :
-         expanded_multi_block_tables) {
-      util::pad_2d_vector(manager_tables, /*pad_value=*/-1);
-      input_params.multi_block_tables.emplace_back(
-          create_2d_tensor(manager_tables, torch::kInt).to(device_));
-    }
-    input_params.input_embedding = torch::stack(expanded_embeddings).to(device_);
-
-    if (!input_params.dp_global_token_nums.empty()) {
-      if (dp_enabled) {
-        constexpr int32_t num_extend_tokens = 2;
-        for (int32_t& token_num : input_params.dp_global_token_nums) {
-          token_num *= num_extend_tokens;
-        }
-      } else if (input_params.dp_global_token_nums.size() == 1) {
-        input_params.dp_global_token_nums[0] =
-            static_cast<int32_t>(buf.out_positions.size());
-      }
-    }
-
-    auto& params = extend_input.sampling_params;
-    torch::TensorOptions idx_options =
-        params.selected_token_idxes.defined()
-            ? params.selected_token_idxes.options()
-            : torch::dtype(torch::kInt).device(device_);
-    params.selected_token_idxes = torch::tensor(selected_row_idx, idx_options);
-    if (!params.sample_idxes.defined()) {
-      params.sample_idxes = torch::arange(num_sequences, idx_options);
-    }
-    return;
-  }
-
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(num_sequences * 2);
   buf.out_positions.reserve(num_sequences * 2);
@@ -871,7 +767,8 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
                                    std::move(buf.out_q_seq_lens),
                                    buf.kv_max_seq_len,
                                    std::move(buf.out_kv_seq_lens),
-                                   /*update_block_tables=*/true);
+                                   /*update_block_tables=*/true,
+                                   device_);
   input_params.input_embedding = torch::stack(expanded_embeddings).to(device_);
 
   if (!input_params.dp_global_token_nums.empty()) {

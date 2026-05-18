@@ -158,16 +158,18 @@ TEST(SpecDecodeInputBuilderTest, MakeDecodeCpuViewUsesFlatBlockTableLayout) {
   torch::Tensor block_tables =
       torch::tensor({{0, 1, 2, 0}, {3, 4, 5, 0}}, torch::kInt);
 
-  DecodeCpuView view = make_decode_cpu_view(
-      token_ids, positions, block_tables, to_slice(kv_seq_lens));
+  ModelInputParams params = make_test_params(2, kv_seq_lens, block_tables);
+  DecodeCpuView view = make_decode_cpu_view(token_ids, positions, params);
 
-  EXPECT_EQ(view.num_sequences, 2);
-  EXPECT_EQ(view.block_table_row_stride, 4);
-  EXPECT_EQ(view.block_tables_data,
-            std::vector<int32_t>({0, 1, 2, 0, 3, 4, 5, 0}));
+  EXPECT_EQ(view.block_table_slices.size(), 2);
+  EXPECT_EQ(view.block_table_slices[0].size(), 4);
+  EXPECT_EQ(std::vector<int32_t>(view.block_table_slices[0].begin(),
+                                 view.block_table_slices[0].end()),
+            std::vector<int32_t>({0, 1, 2, 0}));
+  EXPECT_EQ(std::vector<int32_t>(view.block_table_slices[1].begin(),
+                                 view.block_table_slices[1].end()),
+            std::vector<int32_t>({3, 4, 5, 0}));
 
-  ModelInputParams params;
-  params.num_sequences = 2;
   DecodeBuildBuffers buf;
   append_decode_row(view,
                     {.seq_id = 1, .token_id = 99, .position_offset = 2},
@@ -192,11 +194,13 @@ TEST(SpecDecodeInputBuilderTest, ValidateRowsStartFromCorrectedCurrentView) {
   view.kv_seq_lens = kv_seq_lens;
   view.block_tables_cpu =
       torch::tensor({{0, 1, 2, 0}, {3, 4, 5, 0}}, torch::kInt);
-  view.block_tables_data = {view.block_tables_cpu.data_ptr<int32_t>(),
-                            static_cast<size_t>(view.block_tables_cpu.numel())};
-  view.num_sequences = static_cast<int32_t>(view.block_tables_cpu.size(0));
-  view.block_table_row_stride =
-      static_cast<int32_t>(view.block_tables_cpu.size(1));
+  view.block_table_slices.reserve(view.block_tables_cpu.size(0));
+  for (int64_t seq_id = 0; seq_id < view.block_tables_cpu.size(0); ++seq_id) {
+    torch::Tensor block_table = view.block_tables_cpu[seq_id];
+    view.block_table_slices.emplace_back(
+        block_table.data_ptr<int32_t>(),
+        static_cast<size_t>(block_table.numel()));
+  }
 
   DecodeBuildBuffers buf;
   append_decode_row(
@@ -513,7 +517,7 @@ TEST(SpecDecodeInputBuilderTest, MultiBlockDraftSingleRowPerSeq) {
     row.position_offset = 1;
     row.append_token = false;
     row.append_block_table = true;
-    append_decode_row(params, view, row, /*block_size=*/4, buf);
+    append_decode_row(view, row, /*block_size=*/4, buf);
   }
 
   EXPECT_TRUE(buf.out_token_ids.empty());
@@ -562,7 +566,7 @@ TEST(SpecDecodeInputBuilderTest, MultiBlockValidateExpansion) {
       row.append_q_len_one = true;
       row.append_block_table = true;
       row.append_kv_len = true;
-      append_decode_row(params, view, row, /*block_size=*/4, buf);
+      append_decode_row(view, row, /*block_size=*/4, buf);
     }
   }
 

@@ -610,8 +610,8 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     }
     torch::Tensor last_embedding = accepted_embeddings[seq_id][last_idx];
 
-    const int32_t prev_offset = (last_idx > 0) ? (last_idx - 1) : -1;
-    const int32_t last_offset = last_idx;
+    const int32_t prev_offset = (last_idx > 0) ? last_idx : 0;
+    const int32_t last_offset = last_idx + 1;
     add_row(prev_token_id, prev_offset, prev_embedding);
     add_row(last_token_id, last_offset, last_embedding);
     selected_row_idx.emplace_back(2 * seq_id + 1);

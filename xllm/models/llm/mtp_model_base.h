@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/state_dict/utils.h"
+#include "core/util/utils.h"
 #include "llm_model_base.h"
 
 namespace xllm {
@@ -31,7 +32,7 @@ namespace xllm {
 enum class MtpProjectionType { kConcatEhProj, kAddEHProj };
 
 inline bool is_deepseek_v4_mtp_model(const ModelArgs& model_args) {
-  return model_args.model_type() == "deepseek_v4_mtp";
+  return util::is_target_mtp_model_type(model_args.model_type(), "deepseek_v4");
 }
 
 inline MtpProjectionType get_mtp_projection_type(const ModelArgs& model_args) {

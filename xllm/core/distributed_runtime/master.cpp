@@ -62,10 +62,6 @@ DECLARE_bool(graceful_quit_on_sighup);
 namespace xllm {
 namespace {
 
-bool is_deepseek_v4_model_type(const std::string& model_type) {
-  return model_type == "deepseek_v4" || model_type == "deepseek_v4_mtp";
-}
-
 void print_startup_banner(const std::filesystem::path& model_path,
                           const std::string& backend,
                           int32_t node_rank) {
@@ -150,7 +146,7 @@ Master::Master(const Options& options, EngineType type)
       std::filesystem::path(options_.model_path()).lexically_normal();
   if (options_.enable_prefix_cache() && options_.backend() == "llm") {
     const std::string model_type = util::get_model_type(model_path);
-    if (is_deepseek_v4_model_type(model_type)) {
+    if (util::is_deepseek_v4_model_type(model_type)) {
       LOG(WARNING) << model_type << " does not support prefix cache with "
                       "CompositeBlockManager yet, fallback to "
                       "enable_prefix_cache=false";

@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+﻿/* Copyright 2026 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -327,6 +327,18 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   ForwardInput current_draft_input, validate_input, next_step_input;
   Timer timer;
 
+  {
+    torch::Tensor dbg_tok = safe_to(input.token_ids, torch::kCPU);
+    torch::Tensor dbg_pos = safe_to(input.positions, torch::kCPU);
+    LOG(INFO) << "[MTP_DBG] step_decode enter, overlap=" << enable_schedule_overlap()
+              << " num_seqs=" << input.input_params.num_sequences
+              << " n_spec=" << num_speculative_tokens
+              << " tok=" << std::vector<int32_t>(dbg_tok.data_ptr<int32_t>(),
+                                                  dbg_tok.data_ptr<int32_t>() + dbg_tok.numel())
+              << " pos=" << std::vector<int32_t>(dbg_pos.data_ptr<int32_t>(),
+                                                  dbg_pos.data_ptr<int32_t>() + dbg_pos.numel());
+  }
+
   // Get decode state of last step
   std::vector<EmbeddingCache::DecodeState> last_states =
       embedding_cache_->read_decode_states(input.input_params.embedding_ids,
@@ -403,6 +415,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
               timer.elapsed_seconds());
 
   val_output.next_tokens = val_output.next_tokens.to(torch::kCPU);
+  {
+    auto dbg_nt = val_output.next_tokens;
+    LOG(INFO) << "[MTP_DBG] validate accepted shape=" << dbg_nt.sizes()
+              << " tokens=" << std::vector<int64_t>(
+                     dbg_nt.data_ptr<int64_t>(),
+                     dbg_nt.data_ptr<int64_t>() + std::min<int64_t>(dbg_nt.numel(), 20));
+  }
   write_target_context_to_cache(input, val_output);
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
@@ -425,6 +444,10 @@ void MTPWorkerImpl::write_target_context_to_cache(
                                          validate_output.next_tokens,
                                          validate_output.embeddings,
                                          options_.num_speculative_tokens());
+  LOG(INFO) << "[MTP_DBG] write_cache done emb_ids="
+            << input.input_params.embedding_ids
+            << " emb_defined=" << validate_output.embeddings.defined()
+            << " emb_shape=" << (validate_output.embeddings.defined() ? validate_output.embeddings.sizes() : std::vector<int64_t>{});
 }
 
 void MTPWorkerImpl::record_validate_metrics(
@@ -509,6 +532,19 @@ void MTPWorkerImpl::build_decode_step_view(
         << "decode context position/kv_len mismatch, seq_id=" << seq_id
         << ", current_position=" << current_position
         << ", current_kv_len=" << current_kv_len;
+
+    LOG(INFO) << "[MTP_DBG] build_view seq=" << seq_id
+              << " input_tok=" << input_token_id
+              << " fake=" << input_is_fake_token
+              << " state_valid=" << state.valid
+              << " state_tok=" << state.token_id
+              << " state_pos_off=" << state.position_offset
+              << " state_all_acc=" << state.all_draft_accepted
+              << " correction=" << use_cache_correction
+              << " fake_ctx=" << use_fake_context
+              << " pos_off=" << position_offset
+              << " cur_pos=" << current_position
+              << " cur_kv=" << current_kv_len;
 
     decode_view.token_ids_vec.emplace_back(
         (use_cache_correction || use_fake_context) ? state.token_id
@@ -722,6 +758,14 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       state.token_id = current_token_id >= 0 ? current_token_id : 0;
     }
     const bool use_two_rows = dp_enabled || state.all_draft_accepted;
+    LOG(INFO) << "[MTP_DBG] draft_extend seq=" << seq_id
+              << " view_tok=" << current_token_id
+              << " state_valid=" << state.valid
+              << " state_tok=" << state.token_id
+              << " state_prev_tok=" << state.prev_token_id
+              << " all_acc=" << state.all_draft_accepted
+              << " use_two=" << use_two_rows
+              << " dp=" << dp_enabled;
     if (use_two_rows) {
       int32_t prev_token_id = state.prev_token_id;
       int32_t prev_position_offset = -1;
@@ -757,6 +801,13 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
                                    /*update_block_tables=*/true,
                                    device_);
   input_params.input_embedding = torch::stack(expanded_embeddings).to(device_);
+
+  LOG(INFO) << "[MTP_DBG] draft_extend result"
+            << " tok=" << buf.out_token_ids
+            << " pos=" << buf.out_positions
+            << " kv=" << buf.out_kv_seq_lens
+            << " selected=" << selected_row_idx
+            << " n_seqs=" << input_params.num_sequences;
 
   if (!input_params.dp_global_token_nums.empty()) {
     if (dp_enabled) {

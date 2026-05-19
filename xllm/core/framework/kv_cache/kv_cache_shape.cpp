@@ -57,6 +57,10 @@ void transpose_dim_1_and_2(std::vector<int64_t>* shape) {
   std::swap((*shape)[1], (*shape)[2]);
 }
 
+bool is_deepseek_v4_model_type(const std::string& model_type) {
+  return model_type == "deepseek_v4" || model_type == "deepseek_v4_mtp";
+}
+
 }  // namespace
 
 KVCacheShape::KVCacheShape(const KVCacheCapacity& kv_cache_cap,
@@ -65,7 +69,7 @@ KVCacheShape::KVCacheShape(const KVCacheCapacity& kv_cache_cap,
   CHECK_GT(world_size, 0) << "world_size must be positive.";
   CHECK_GT(kv_cache_cap.block_size(), 0) << "block_size must be positive.";
 
-  if (model_args.model_type() == "deepseek_v4") {
+  if (is_deepseek_v4_model_type(model_args.model_type())) {
     key_cache_shape_ = std::vector<int64_t>{kv_cache_cap.swa_count(),
                                             kv_cache_cap.c4_count(),
                                             kv_cache_cap.c128_count()};

@@ -42,6 +42,10 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+bool is_deepseek_v4_model_type(const std::string& model_type) {
+  return model_type == "deepseek_v4" || model_type == "deepseek_v4_mtp";
+}
+
 std::unique_ptr<KVCacheImpl> create_kv_cache_impl(
     const KVCacheShape& kv_cache_shape,
     const KVCacheCreateOptions& create_options,
@@ -413,7 +417,7 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
   const int64_t num_layers = create_options.num_layers();
   kv_caches.reserve(num_layers);
 
-  if (create_options.model_type() == "deepseek_v4") {
+  if (is_deepseek_v4_model_type(create_options.model_type())) {
     std::vector<int32_t> layer_compress_ratios;
     layer_compress_ratios.reserve(static_cast<size_t>(num_layers));
     std::map<int32_t, std::string> ratio_shape_summaries;

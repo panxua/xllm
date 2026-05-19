@@ -33,6 +33,11 @@ namespace xllm {
 namespace layer {
 
 namespace {
+
+bool is_deepseek_v4_model_type(const std::string& model_type) {
+  return model_type == "deepseek_v4" || model_type == "deepseek_v4_mtp";
+}
+
 // Generic local tensor helpers.
 torch::Tensor get_tensor_with_weight_suffix(const StateDict& state_dict,
                                             const std::string& tensor_name) {
@@ -268,7 +273,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
       n_shared_experts_(model_args.n_shared_experts()),
       is_gated_(moe_args.is_gated),
       skip_gate_load_(moe_args.skip_gate_load),
-      is_deepseek_v4_(model_args.model_type() == "deepseek_v4"),
+      is_deepseek_v4_(is_deepseek_v4_model_type(model_args.model_type())),
       renormalize_(model_args.norm_topk_prob() ? 1 : 0),
       hidden_act_(model_args.hidden_act()),
       scoring_func_(model_args.scoring_func()),

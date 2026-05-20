@@ -545,7 +545,8 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   // all swa-related cache size from cache_size_in_bytes, then compute
   // c4_count / c128_count (c4_count = 32 * c128_count).
   // cache_size_in_bytes is already the full available device memory.
-  if (util::is_deepseek_v4_model_type(args_.model_type())) {
+  if (args_.model_type() == "deepseek_v4" ||
+      args_.model_type() == "deepseek_v4_mtp") {
     const int64_t max_seqs =
         static_cast<int64_t>(std::max(options_.max_seqs_per_batch(), 1));
     const int32_t block_size = options_.block_size();
@@ -722,7 +723,8 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
 
   // init kv cache for each worker
   const KVCacheShape kv_cache_shape(kv_cache_cap, args_, dp_local_tp_size_);
-  if (util::is_deepseek_v4_model_type(args_.model_type())) {
+  if (args_.model_type() == "deepseek_v4" ||
+      args_.model_type() == "deepseek_v4_mtp") {
     LOG(INFO) << "Initializing DSV4 kv cache with shape: [swa_count="
               << kv_cache_cap.swa_count()
               << ", c4_count=" << kv_cache_cap.c4_count()
@@ -746,7 +748,8 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .num_layers(args_.n_layers())
       .slot_size(kv_cache_cap.slot_size())
       .model_id(options_.model_id());
-  if (util::is_deepseek_v4_model_type(args_.model_type())) {
+  if (args_.model_type() == "deepseek_v4" ||
+      args_.model_type() == "deepseek_v4_mtp") {
     constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
     constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
 

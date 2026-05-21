@@ -27,6 +27,7 @@ limitations under the License.
 #include <tuple>
 
 #include "core/common/global_flags.h"
+#include "core/util/tensor_helper.h"
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/framework/OpCommand.h>
 #else
@@ -1103,6 +1104,76 @@ bool AclGraph::capture(CausalLM* model,
     LOG(INFO) << "capture begin, bucket_num_tokens: " << bucket_num_tokens
               << ", actual_num_tokens: " << actual_num_tokens;
 
+    auto& capture_params = graph_params.value();
+    LOG(INFO) << "[AclGraph::capture] input_params_for_capture:"
+              << " num_sequences=" << capture_params.num_sequences
+              << " actual_num_sequences=" << capture_params.actual_num_sequences
+              << " kv_max_seq_len=" << capture_params.kv_max_seq_len
+              << " q_max_seq_len=" << capture_params.q_max_seq_len
+              << " enable_graph=" << capture_params.enable_graph
+              << " batch_forward_type="
+              << capture_params.batch_forward_type.to_string();
+    LOG(INFO) << "[AclGraph::capture] kv_seq_lens_vec="
+              << capture_params.kv_seq_lens_vec;
+    LOG(INFO) << "[AclGraph::capture] q_seq_lens_vec="
+              << capture_params.q_seq_lens_vec;
+    LOG(INFO) << "[AclGraph::capture] dp_global_token_nums="
+              << capture_params.dp_global_token_nums;
+    print_tensor(capture_params.kv_seq_lens,
+                 "[AclGraph::capture] kv_seq_lens", 10);
+    print_tensor(capture_params.q_seq_lens,
+                 "[AclGraph::capture] q_seq_lens", 10);
+    print_tensor(capture_params.new_cache_slots,
+                 "[AclGraph::capture] new_cache_slots", 10);
+    print_tensor(capture_params.block_tables,
+                 "[AclGraph::capture] block_tables", 10);
+    print_tensor(capture_params.q_cu_seq_lens,
+                 "[AclGraph::capture] q_cu_seq_lens", 10);
+    if (capture_params.input_embedding.defined()) {
+      print_tensor(capture_params.input_embedding,
+                   "[AclGraph::capture] input_embedding", 10);
+      LOG(INFO) << "[AclGraph::capture] input_embedding shape: "
+                << capture_params.input_embedding.sizes()
+                << " dtype: " << capture_params.input_embedding.dtype()
+                << " device: " << capture_params.input_embedding.device();
+    }
+    if (capture_params.graph_buffer.tiling_data.defined()) {
+      LOG(INFO) << "[AclGraph::capture] tiling_data shape: "
+                << capture_params.graph_buffer.tiling_data.sizes()
+                << " dtype: " << capture_params.graph_buffer.tiling_data.dtype();
+    }
+    if (capture_params.graph_buffer.attn_mask.defined()) {
+      LOG(INFO) << "[AclGraph::capture] attn_mask shape: "
+                << capture_params.graph_buffer.attn_mask.sizes()
+                << " dtype: " << capture_params.graph_buffer.attn_mask.dtype();
+    }
+    if (capture_params.attn_metadata) {
+      LOG(INFO) << "[AclGraph::capture] attn_metadata is set (non-null)";
+      if (capture_params.attn_metadata->dsa_metadata) {
+        auto& dsa = *capture_params.attn_metadata->dsa_metadata;
+        LOG(INFO) << "[AclGraph::capture] dsa_metadata present"
+                  << " packed_metadata_buffer.defined="
+                  << dsa.packed_metadata_buffer.defined()
+                  << " start_pos.defined=" << dsa.start_pos.defined()
+                  << " attn_mask.defined=" << dsa.attn_mask.defined();
+        if (dsa.packed_metadata_buffer.defined()) {
+          LOG(INFO) << "[AclGraph::capture] packed_metadata_buffer shape: "
+                    << dsa.packed_metadata_buffer.sizes()
+                    << " device: " << dsa.packed_metadata_buffer.device();
+        }
+        if (dsa.start_pos.defined()) {
+          print_tensor(dsa.start_pos,
+                       "[AclGraph::capture] dsa.start_pos", 10);
+        }
+      }
+    } else {
+      LOG(INFO) << "[AclGraph::capture] attn_metadata is null";
+    }
+    print_tensor(persistent_param_.persistent_tokens(num_tokens_),
+                 "[AclGraph::capture] persistent_tokens", 10);
+    print_tensor(persistent_param_.persistent_positions(num_tokens_),
+                 "[AclGraph::capture] persistent_positions", 10);
+
     // no mempool id, will create a new one; capture mode is thread local, allow
     // other threads to execute synchronous operations
     graph_.capture_begin(
@@ -1262,11 +1333,50 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   VLOG(50) << "in_decoding_phase: " << in_decoding_phase
            << " q_max_seq_len: " << params_single.q_max_seq_len
            << " n_layers: " << args_.n_layers();
+
+  auto log_eager_input_params = [&](const char* reason) {
+    LOG(INFO) << "[AclGraph::eager] reason=" << reason
+              << " num_sequences=" << params_single.num_sequences
+              << " actual_num_sequences=" << params_single.actual_num_sequences
+              << " kv_max_seq_len=" << params_single.kv_max_seq_len
+              << " q_max_seq_len=" << params_single.q_max_seq_len
+              << " enable_graph=" << params_single.enable_graph
+              << " batch_forward_type="
+              << params_single.batch_forward_type.to_string()
+              << " tokens_size=" << tokens.size(0)
+              << " positions_size=" << positions.size(0);
+    LOG(INFO) << "[AclGraph::eager] kv_seq_lens_vec="
+              << params_single.kv_seq_lens_vec;
+    LOG(INFO) << "[AclGraph::eager] q_seq_lens_vec="
+              << params_single.q_seq_lens_vec;
+    LOG(INFO) << "[AclGraph::eager] dp_global_token_nums="
+              << params_single.dp_global_token_nums;
+    print_tensor(params_single.kv_seq_lens,
+                 "[AclGraph::eager] kv_seq_lens", 10);
+    print_tensor(params_single.q_seq_lens,
+                 "[AclGraph::eager] q_seq_lens", 10);
+    print_tensor(params_single.new_cache_slots,
+                 "[AclGraph::eager] new_cache_slots", 10);
+    print_tensor(params_single.block_tables,
+                 "[AclGraph::eager] block_tables", 10);
+    if (params_single.input_embedding.defined()) {
+      LOG(INFO) << "[AclGraph::eager] input_embedding shape: "
+                << params_single.input_embedding.sizes()
+                << " dtype: " << params_single.input_embedding.dtype()
+                << " device: " << params_single.input_embedding.device();
+    }
+    if (params_single.attn_metadata) {
+      LOG(INFO) << "[AclGraph::eager] attn_metadata is set (non-null)";
+    } else {
+      LOG(INFO) << "[AclGraph::eager] attn_metadata is null";
+    }
+  };
   // If not in decode phase, use eager mode directly without acl graph
   // TODO: fix mtp model support.
   if (!in_decoding_phase || args_.n_layers() == 1) {
+    log_eager_input_params("non-decode or single layer");
     VLOG(kGraphExecutorLogVerboseLevel)
-        << "AclGraphExecutorImpl::run() in eager mode";
+        << "AclGraphExecutorImpl::run() in eager mode (non-decode or single layer)";
     COUNTER_INC(num_model_execution_total_eager);
     return model_->forward(tokens, positions, kv_caches, params);
   }
@@ -1287,6 +1397,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   const uint32_t decode_batch_size_limit = static_cast<uint32_t>(
       std::max<int32_t>(1, options_.max_seqs_per_batch()));
   if (actual_batch_size > decode_batch_size_limit) {
+    log_eager_input_params("decode batch_size exceeds limit");
     LOG_FIRST_N(WARNING, 1)
         << "Falling back to eager mode because decode batch_size ("
         << actual_batch_size << ") > " << decode_batch_size_limit
@@ -1309,6 +1420,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   // Early return if conditions are not suitable for graph operations
   if (!capture_supported) {
+    log_eager_input_params("seq_len not supported");
     LOG_FIRST_N(WARNING, 1)
         << "Falling back to eager mode because kv_max_seq_len ("
         << params_single.kv_max_seq_len << ") > max_seq_len (" << max_seq_len
@@ -1376,6 +1488,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   }
 
   // Fallback to eager mode if capture fails
+  log_eager_input_params("capture failed");
   LOG(ERROR) << "Failed to capture ACL graph for bucket num_tokens: "
              << bucket_num_tokens;
   COUNTER_INC(num_model_execution_total_eager);

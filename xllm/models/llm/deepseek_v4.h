@@ -989,42 +989,36 @@ class DeepseekV4ModelImpl
   }
 
   void normalize_graph_metadata_input_params(ModelInputParams& params) const {
-    const int64_t actual_batch_size =
+    int64_t actual_metadata_rows =
         std::max<int64_t>(infer_actual_batch_size(params), 0);
-    int64_t metadata_batch_size = params.meta.actual_num_sequences;
+    int64_t padded_metadata_rows = actual_metadata_rows;
     if (params.enable_cuda_graph) {
-      metadata_batch_size =
-          std::max<int64_t>(metadata_batch_size, params.meta.num_sequences);
+      padded_metadata_rows =
+          std::max<int64_t>(padded_metadata_rows, params.meta.num_sequences);
     }
-    if (metadata_batch_size <= 0) {
-      metadata_batch_size = 1;
+    if (padded_metadata_rows <= 0) {
+      padded_metadata_rows = 1;
     }
+    actual_metadata_rows = std::min<int64_t>(actual_metadata_rows,
+                                             padded_metadata_rows);
 
-    auto trim_lens_vec =
-        [metadata_batch_size, actual_batch_size](std::vector<int32_t>& lens) {
+    auto trim_lens_vec = [padded_metadata_rows,
+                          actual_metadata_rows](std::vector<int32_t>& lens) {
       if (lens.empty()) {
-        lens.assign(static_cast<size_t>(metadata_batch_size), 0);
-      } else if (static_cast<int64_t>(lens.size()) < metadata_batch_size) {
-        lens.resize(static_cast<size_t>(metadata_batch_size), 0);
+        lens.assign(static_cast<size_t>(padded_metadata_rows), 0);
+      } else if (static_cast<int64_t>(lens.size()) < padded_metadata_rows) {
+        lens.resize(static_cast<size_t>(padded_metadata_rows), 0);
       } else {
-        lens.resize(static_cast<size_t>(metadata_batch_size));
+        lens.resize(static_cast<size_t>(padded_metadata_rows));
       }
-      for (int64_t i = 0; i < static_cast<int64_t>(lens.size()); ++i) {
-        if (i < actual_batch_size) {
-          lens[static_cast<size_t>(i)] = std::max<int32_t>(lens[i], 1);
-        } else {
-          lens[static_cast<size_t>(i)] = 0;
-        }
-      }
+      std::fill(lens.begin() + actual_metadata_rows, lens.end(), 0);
     };
 
-    // Graph forward tensors are padded to the decode bucket. Build metadata
-    // for the same padded row count so compressor/attention inputs agree.
     trim_lens_vec(params.attention.host.kv_seq_lens);
     trim_lens_vec(params.attention.host.q_seq_lens);
-    params.meta.num_sequences = static_cast<int32_t>(metadata_batch_size);
+    params.meta.num_sequences = static_cast<int32_t>(padded_metadata_rows);
     params.meta.actual_num_sequences =
-        static_cast<int32_t>(metadata_batch_size);
+        static_cast<int32_t>(actual_metadata_rows);
   }
 
   std::shared_ptr<layer::AttentionMetadata>
@@ -1069,6 +1063,7 @@ class DeepseekV4ModelImpl
                                .device(torch::kCPU)
                                .pinned_memory(true);
     params.meta.num_sequences = 1;
+    params.meta.actual_num_sequences = 1;
     params.meta.kv_max_seq_len =
         std::max<int32_t>(params.meta.kv_max_seq_len, 1);
     params.meta.q_max_seq_len =

@@ -415,6 +415,10 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
         std::max<int64_t>(options_.num_decoding_tokens(), 1);
     actual_batch_size = actual_num_tokens / decode_tokens;
   }
+  const int64_t padded_batch_size = static_cast<int64_t>(padded_num_tokens);
+  const int64_t actual_metadata_rows = std::min<int64_t>(
+      padded_batch_size,
+      std::max<int64_t>(actual_batch_size, params.meta.num_sequences));
 
   // Copy data from input parameters to persistent graph tensors
   if (actual_num_tokens > 0) {
@@ -451,11 +455,12 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     }
   }
   int64_t q_copy_len = 0;
-  if (actual_batch_size > 0 && params.attention.device.q_seq_lens.defined() &&
+  if (actual_metadata_rows > 0 &&
+      params.attention.device.q_seq_lens.defined() &&
       params.attention.device.q_seq_lens.dim() >= 1 &&
       params.attention.device.q_seq_lens.numel() > 0) {
     q_copy_len = std::min<int64_t>(
-        actual_batch_size, params.attention.device.q_seq_lens.size(0));
+        actual_metadata_rows, params.attention.device.q_seq_lens.size(0));
     if (q_copy_len > 0) {
       q_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/q_copy_len)
           .copy_(params.attention.device.q_seq_lens.slice(/*dim=*/0,
@@ -465,11 +470,12 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     }
   }
   int64_t kv_copy_len = 0;
-  if (actual_batch_size > 0 && params.attention.device.kv_seq_lens.defined() &&
+  if (actual_metadata_rows > 0 &&
+      params.attention.device.kv_seq_lens.defined() &&
       params.attention.device.kv_seq_lens.dim() >= 1 &&
       params.attention.device.kv_seq_lens.numel() > 0) {
     kv_copy_len = std::min<int64_t>(
-        actual_batch_size, params.attention.device.kv_seq_lens.size(0));
+        actual_metadata_rows, params.attention.device.kv_seq_lens.size(0));
     if (kv_copy_len > 0) {
       kv_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/kv_copy_len)
           .copy_(params.attention.device.kv_seq_lens.slice(/*dim=*/0,
@@ -478,7 +484,6 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                  /*non_blocking=*/true);
     }
   }
-  const int64_t padded_batch_size = static_cast<int64_t>(padded_num_tokens);
   if (q_copy_len < padded_batch_size) {
     q_seq_lens_
         .slice(/*dim=*/0, /*start=*/q_copy_len, /*end=*/padded_batch_size)
@@ -540,12 +545,12 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   // zeroed in the active bucket slice.
   int64_t block_rows_to_copy = 0;
   int64_t actual_block_table_len = 0;
-  if (actual_batch_size > 0 &&
+  if (actual_metadata_rows > 0 &&
       params.attention.device.block_tables.defined() &&
       params.attention.device.block_tables.dim() >= 2 &&
       params.attention.device.block_tables.numel() > 0) {
     block_rows_to_copy = std::min<int64_t>(
-        actual_batch_size, params.attention.device.block_tables.size(0));
+        actual_metadata_rows, params.attention.device.block_tables.size(0));
     actual_block_table_len = params.attention.device.block_tables.size(1);
     if (block_rows_to_copy > 0 && actual_block_table_len > 0) {
       auto slice_persistent_block_tables =
@@ -567,9 +572,9 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                /*end=*/persistent_block_tables_.size(1))
         .zero_();
   }
-  if (actual_batch_size < padded_batch_size) {
+  if (actual_metadata_rows < padded_batch_size) {
     zero_tensor_tail(
-        persistent_block_tables_, actual_batch_size, padded_batch_size);
+        persistent_block_tables_, actual_metadata_rows, padded_batch_size);
   }
 
   // Update persistent embedding from input_embedding if available
@@ -602,7 +607,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       (has_q_cu && params.attention.device.q_cu_seq_lens.numel() > 0)
           ? params.attention.device.q_cu_seq_lens.size(0)
           : 0;
-  const int64_t q_cu_copy_len = std::min<int64_t>(actual_batch_size, q_cu_size);
+  const int64_t q_cu_copy_len =
+      std::min<int64_t>(actual_metadata_rows, q_cu_size);
   if (q_cu_copy_len > 0) {
     q_cu_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/q_cu_copy_len)
         .copy_(params.attention.device.q_cu_seq_lens.slice(
@@ -650,7 +656,6 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   if (return_capture_params) {
     std::optional<ModelInputParams> params_for_capture =
         std::make_optional<ModelInputParams>(params);
-    // Set persistent buffers in params_for_capture
     params_for_capture->attention.device.kv_seq_lens =
         kv_seq_lens(padded_num_tokens);
     params_for_capture->attention.device.q_seq_lens =
@@ -658,17 +663,15 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     params_for_capture->attention.host.kv_seq_lens.resize(padded_num_tokens);
     params_for_capture->attention.host.q_seq_lens.resize(padded_num_tokens);
     params_for_capture->meta.actual_num_sequences =
-        static_cast<int32_t>(actual_batch_size);
-    // Copy actual values from original params
-    for (int64_t i = 0; i < actual_batch_size; ++i) {
+        static_cast<int32_t>(actual_metadata_rows);
+    for (int64_t i = 0; i < actual_metadata_rows; ++i) {
       const size_t index = static_cast<size_t>(i);
       params_for_capture->attention.host.kv_seq_lens[index] =
           params.attention.host.kv_seq_lens[index];
       params_for_capture->attention.host.q_seq_lens[index] =
           params.attention.host.q_seq_lens[index];
     }
-    // Fill padded positions with default values
-    for (int64_t i = actual_batch_size; i < padded_batch_size; ++i) {
+    for (int64_t i = actual_metadata_rows; i < padded_batch_size; ++i) {
       const size_t index = static_cast<size_t>(i);
       params_for_capture->attention.host.kv_seq_lens[index] = kPaddingSeqLen;
       params_for_capture->attention.host.q_seq_lens[index] = kPaddingSeqLen;

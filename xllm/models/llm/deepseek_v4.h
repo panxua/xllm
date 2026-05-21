@@ -23,12 +23,8 @@ limitations under the License.
 #include <cctype>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
-#include <iomanip>
 #include <limits>
 #include <memory>
-#include <optional>
-#include <sstream>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -72,268 +68,32 @@ inline torch::Tensor deepseek_v4_create_hadamard_matrix(
   return matrix;
 }
 
-inline std::string deepseek_v4_format_bytes(int64_t bytes) {
-  static constexpr const char* kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-  double value = static_cast<double>(bytes);
-  int unit_idx = 0;
-  while (value >= 1024.0 && unit_idx < 4) {
-    value /= 1024.0;
-    ++unit_idx;
-  }
-
-  std::ostringstream os;
-  if (value < 10.0 && unit_idx > 0) {
-    os << std::fixed << std::setprecision(2);
-  } else if (value < 100.0 && unit_idx > 0) {
-    os << std::fixed << std::setprecision(1);
-  } else {
-    os << std::fixed << std::setprecision(0);
-  }
-  os << value << " " << kUnits[unit_idx];
-  return os.str();
-}
-
 inline torch::Tensor maybe_to_device(const torch::Tensor& tensor,
                                      const torch::Device& device) {
-  if (!tensor.defined() || tensor.device() == device) {
-    return tensor;
-  }
-  return tensor.to(device);
+  return dsa_maybe_to_device(tensor, device);
 }
 
 inline bool deepseek_v4_uses_acl_graph(
     const xllm::ModelInputParams& input_params) {
 #if defined(USE_NPU)
-  return FLAGS_enable_graph && input_params.enable_graph;
+  return FLAGS_enable_graph && input_params.enable_cuda_graph;
 #else
   (void)input_params;
   return false;
 #endif
 }
 
-inline size_t deepseek_v4_align_up(size_t value, size_t alignment) {
-  return ((value + alignment - 1) / alignment) * alignment;
-}
-
-struct DeepseekV4PackedTensorSpec {
-  torch::Tensor cpu_tensor;
-  std::vector<torch::Tensor*> targets;
-  std::vector<int64_t> sizes;
-  torch::ScalarType dtype = torch::kUInt8;
-  size_t offset = 0;
-  size_t nbytes = 0;
-};
-
-inline void deepseek_v4_add_packed_tensor(
-    torch::Tensor& tensor,
-    const torch::Device& runtime_device,
-    std::vector<DeepseekV4PackedTensorSpec>& specs) {
-  if (!tensor.defined() || tensor.device() == runtime_device) {
-    return;
-  }
-  if (!tensor.device().is_cpu() || tensor.numel() == 0) {
-    tensor = maybe_to_device(tensor, runtime_device);
-    return;
-  }
-
-  if (tensor.is_contiguous()) {
-    const size_t nbytes =
-        static_cast<size_t>(tensor.numel() * tensor.element_size());
-    for (auto& spec : specs) {
-      if (spec.cpu_tensor.data_ptr() == tensor.data_ptr() &&
-          spec.nbytes == nbytes && spec.dtype == tensor.scalar_type() &&
-          spec.sizes == tensor.sizes().vec()) {
-        spec.targets.push_back(&tensor);
-        return;
-      }
-    }
-  }
-
-  auto contiguous = tensor.contiguous();
-  const size_t nbytes =
-      static_cast<size_t>(contiguous.numel() * contiguous.element_size());
-  for (auto& spec : specs) {
-    if (spec.cpu_tensor.data_ptr() == contiguous.data_ptr() &&
-        spec.nbytes == nbytes && spec.dtype == contiguous.scalar_type() &&
-        spec.sizes == contiguous.sizes().vec()) {
-      spec.targets.push_back(&tensor);
-      return;
-    }
-  }
-
-  DeepseekV4PackedTensorSpec spec;
-  spec.cpu_tensor = std::move(contiguous);
-  spec.targets.push_back(&tensor);
-  spec.sizes = spec.cpu_tensor.sizes().vec();
-  spec.dtype = spec.cpu_tensor.scalar_type();
-  spec.nbytes = nbytes;
-  specs.push_back(std::move(spec));
-}
-
-inline void deepseek_v4_collect_cpu_metadata_tensors(
-    layer::DSAMetadata& dsa,
-    const torch::Device& runtime_device,
-    std::vector<DeepseekV4PackedTensorSpec>& specs) {
-  deepseek_v4_add_packed_tensor(dsa.seq_lens, runtime_device, specs);
-  deepseek_v4_add_packed_tensor(dsa.seq_lens_q, runtime_device, specs);
-  deepseek_v4_add_packed_tensor(
-      dsa.actual_seq_lengths_query, runtime_device, specs);
-  deepseek_v4_add_packed_tensor(
-      dsa.actual_seq_lengths_kv, runtime_device, specs);
-  deepseek_v4_add_packed_tensor(dsa.max_seqlen_q, runtime_device, specs);
-  deepseek_v4_add_packed_tensor(dsa.max_seqlen_kv, runtime_device, specs);
-  deepseek_v4_add_packed_tensor(dsa.input_positions, runtime_device, specs);
-  deepseek_v4_add_packed_tensor(dsa.c4_pad_positions, runtime_device, specs);
-  deepseek_v4_add_packed_tensor(dsa.c128_pad_positions, runtime_device, specs);
-
-  for (auto& layer_block_tables : dsa.block_tables) {
-    for (auto& block_table : layer_block_tables) {
-      deepseek_v4_add_packed_tensor(block_table, runtime_device, specs);
-    }
-  }
-  for (auto& layer_slot_mappings : dsa.slot_mappings) {
-    for (auto& slot_mapping : layer_slot_mappings) {
-      deepseek_v4_add_packed_tensor(slot_mapping, runtime_device, specs);
-    }
-  }
-  deepseek_v4_add_packed_tensor(dsa.hadamard, runtime_device, specs);
-}
-
-inline size_t deepseek_v4_layout_packed_tensor_specs(
-    std::vector<DeepseekV4PackedTensorSpec>& specs) {
-  static constexpr size_t kAlignment = 64;
-  size_t total_bytes = 0;
-  for (auto& spec : specs) {
-    total_bytes = deepseek_v4_align_up(total_bytes, kAlignment);
-    spec.offset = total_bytes;
-    total_bytes += spec.nbytes;
-  }
-  return total_bytes;
-}
-
-inline torch::Tensor deepseek_v4_build_packed_host_buffer(
-    const std::vector<DeepseekV4PackedTensorSpec>& specs,
-    size_t total_bytes) {
-  auto host_buffer = torch::empty({static_cast<int64_t>(total_bytes)},
-                                  torch::TensorOptions()
-                                      .dtype(torch::kUInt8)
-                                      .device(torch::kCPU)
-                                      .pinned_memory(true));
-  auto* host_ptr = static_cast<uint8_t*>(host_buffer.data_ptr());
-  for (const auto& spec : specs) {
-    std::memcpy(
-        host_ptr + spec.offset, spec.cpu_tensor.data_ptr(), spec.nbytes);
-  }
-  return host_buffer;
-}
-
-inline void deepseek_v4_fill_packed_host_buffer(
-    const std::vector<DeepseekV4PackedTensorSpec>& specs,
-    const torch::Tensor& host_buffer) {
-  auto* host_ptr = static_cast<uint8_t*>(host_buffer.data_ptr());
-  for (const auto& spec : specs) {
-    std::memcpy(
-        host_ptr + spec.offset, spec.cpu_tensor.data_ptr(), spec.nbytes);
-  }
-}
-
-inline void deepseek_v4_bind_packed_tensor_views(
-    const std::vector<DeepseekV4PackedTensorSpec>& specs,
-    const torch::Tensor& device_buffer) {
-  const auto* device_ptr =
-      static_cast<const uint8_t*>(device_buffer.data_ptr());
-  for (const auto& spec : specs) {
-    auto view =
-        get_tensor_from_blob(spec.sizes, spec.dtype, device_ptr + spec.offset);
-    for (auto* target : spec.targets) {
-      *target = view;
-    }
-  }
-}
-
-inline void deepseek_v4_move_dsa_metadata_to_device(
-    layer::DSAMetadata& dsa,
-    const torch::Device& runtime_device) {
-  dsa.seq_lens = maybe_to_device(dsa.seq_lens, runtime_device);
-  dsa.seq_lens_q = maybe_to_device(dsa.seq_lens_q, runtime_device);
-  dsa.actual_seq_lengths_query =
-      maybe_to_device(dsa.actual_seq_lengths_query, runtime_device);
-  dsa.actual_seq_lengths_kv =
-      maybe_to_device(dsa.actual_seq_lengths_kv, runtime_device);
-  dsa.max_seqlen_q = maybe_to_device(dsa.max_seqlen_q, runtime_device);
-  dsa.max_seqlen_kv = maybe_to_device(dsa.max_seqlen_kv, runtime_device);
-  dsa.input_positions = maybe_to_device(dsa.input_positions, runtime_device);
-  dsa.c4_pad_positions = maybe_to_device(dsa.c4_pad_positions, runtime_device);
-  dsa.c128_pad_positions =
-      maybe_to_device(dsa.c128_pad_positions, runtime_device);
-
-  for (auto& layer_block_tables : dsa.block_tables) {
-    for (auto& block_table : layer_block_tables) {
-      block_table = maybe_to_device(block_table, runtime_device);
-    }
-  }
-  for (auto& layer_slot_mappings : dsa.slot_mappings) {
-    for (auto& slot_mapping : layer_slot_mappings) {
-      slot_mapping = maybe_to_device(slot_mapping, runtime_device);
-    }
-  }
-
-  dsa.hadamard = maybe_to_device(dsa.hadamard, runtime_device);
-}
-
-inline void deepseek_v4_pack_dsa_metadata_to_device(
-    layer::DSAMetadata& dsa,
-    const torch::Device& runtime_device) {
-#if defined(USE_NPU)
-  if (runtime_device.is_cpu() ||
-      runtime_device.type() != c10::DeviceType::PrivateUse1) {
-    deepseek_v4_move_dsa_metadata_to_device(dsa, runtime_device);
-    return;
-  }
-
-  std::vector<DeepseekV4PackedTensorSpec> specs;
-  deepseek_v4_collect_cpu_metadata_tensors(dsa, runtime_device, specs);
-  const size_t total_bytes = deepseek_v4_layout_packed_tensor_specs(specs);
-  if (total_bytes == 0) {
-    return;
-  }
-
-  auto host_buffer = deepseek_v4_build_packed_host_buffer(specs, total_bytes);
-  dsa.packed_metadata_buffer = safe_to(
-      host_buffer,
-      torch::TensorOptions().dtype(torch::kUInt8).device(runtime_device),
-      false);
-  deepseek_v4_bind_packed_tensor_views(specs, dsa.packed_metadata_buffer);
-#else
-  deepseek_v4_move_dsa_metadata_to_device(dsa, runtime_device);
-#endif
-}
-
-struct DeepseekV4GraphMetadataState : ModelGraphMetadataState {
-  struct DSAMetadataPersistent {
-    torch::Tensor packed_metadata_host_buffer;
-    torch::Tensor packed_metadata_buffer;
-    torch::Tensor attn_mask;
-    torch::Tensor start_pos;
-  };
-
-  DSAMetadataPersistent dsa_metadata_persistent;
-};
-
 // Group key: (ratio, type, block_size) -> group_id
-class DSAGroupKey {
- public:
+struct DSAGroupKey {
   int32_t ratio;
   DSACacheType type;
   int32_t block_size;
-
   bool operator==(const DSAGroupKey& o) const {
     return ratio == o.ratio && type == o.type && block_size == o.block_size;
   }
 };
 
-class DSAGroupKeyHash {
- public:
+struct DSAGroupKeyHash {
   size_t operator()(const DSAGroupKey& k) const {
     size_t h = std::hash<int32_t>()(k.ratio);
     h ^= std::hash<int32_t>()(static_cast<int32_t>(k.type)) << 16;
@@ -439,7 +199,8 @@ class DeepseekV4ModelImpl
     norm_eps_ = static_cast<double>(model_args.rms_norm_eps());
 
     num_heads_ = model_args.n_heads();
-    head_dim_ = model_args.head_dim();
+    // head_dim_ = model_args.head_dim();
+    head_dim_ = model_args.o_lora_rank() + model_args.qk_rope_head_dim();
     dp_local_tp_size_ =
         std::max<int64_t>(parallel_args.world_size() /
                               std::max<int64_t>(parallel_args.dp_size(), 1),
@@ -607,7 +368,7 @@ class DeepseekV4ModelImpl
 
   std::unique_ptr<ModelGraphMetadataState>
   create_graph_forward_metadata_state() {
-    return std::make_unique<DeepseekV4GraphMetadataState>();
+    return std::make_unique<DSAGraphMetadataState>("DeepSeek V4");
   }
 
   void prepare_graph_forward_metadata(ModelGraphMetadataState* state,
@@ -615,15 +376,25 @@ class DeepseekV4ModelImpl
                                       ModelInputParams& input_params) {
     CHECK(state != nullptr)
         << "DeepSeek V4 graph metadata state must be initialized";
-    auto* deepseek_v4_state =
-        dynamic_cast<DeepseekV4GraphMetadataState*>(state);
-    CHECK(deepseek_v4_state != nullptr)
+    auto* dsa_state = dynamic_cast<DSAGraphMetadataState*>(state);
+    CHECK(dsa_state != nullptr)
         << "DeepSeek V4 received incompatible graph metadata state";
     auto modified_input_params = input_params;
     if (modified_input_params.meta.actual_num_sequences == 0) {
-      fill_empty_dp_rank_input_params(modified_input_params);
+      // Graph metadata must keep the bucket-shaped sequence count used during
+      // capture/replay. The normal empty-DP fallback intentionally shrinks the
+      // request to one dummy token for eager/forward execution; using it here
+      // would capture a too-small packed metadata buffer and later replay can
+      // exceed that persistent capacity when another DP shard has real tokens.
+      if (modified_input_params.enable_cuda_graph &&
+          modified_input_params.meta.num_sequences > 0) {
+        fill_empty_dp_rank_graph_metadata_input_params(modified_input_params);
+      } else {
+        fill_empty_dp_rank_input_params(modified_input_params);
+      }
     }
-    normalize_graph_metadata_input_params(modified_input_params);
+    normalize_dsa_graph_metadata_input_params(modified_input_params,
+                                              /*decode_tokens=*/1);
     auto& dp_token_nums = modified_input_params.parallel.dp_global_token_nums;
     std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
 
@@ -638,20 +409,17 @@ class DeepseekV4ModelImpl
       if (dsa_hadamard_.defined()) {
         dsa.hadamard = dsa_hadamard_;
       }
-      copy_to_graph_packed_metadata_buffer(
-          dsa, deepseek_v4_state->dsa_metadata_persistent, positions.device());
+      copy_to_dsa_graph_packed_metadata_buffer(dsa, *dsa_state, positions.device());
       prepare_dsa_metadata_for_forward(*attn_metadata,
                                        positions.device(),
                                        /*pack_metadata=*/false,
                                        /*build_rope=*/false);
     }
     input_params.attn_metadata = persist_graph_attention_metadata(
-        *deepseek_v4_state, std::move(attn_metadata));
+        *dsa_state, std::move(attn_metadata));
     CHECK(input_params.attn_metadata)
         << "DeepSeek V4 ACL graph requires DSA metadata";
   }
-
-  void log_weight_mem_stats() const { log_layer_weight_mem_stats(); }
 
   ModelOutput forward(torch::Tensor tokens,
                       torch::Tensor positions,
@@ -696,7 +464,8 @@ class DeepseekV4ModelImpl
       fill_empty_dp_rank_input_params(modified_input_params, &kv_caches);
     }
     if (acl_graph_forward) {
-      normalize_graph_metadata_input_params(modified_input_params);
+      normalize_dsa_graph_metadata_input_params(modified_input_params,
+                                                /*decode_tokens=*/1);
     }
     auto& dp_token_nums = modified_input_params.parallel.dp_global_token_nums;
     // DP helper: keep zero entries at least 1 to avoid empty slices/padding
@@ -735,7 +504,7 @@ class DeepseekV4ModelImpl
         if (dsa_hadamard_.defined()) {
           dsa.hadamard = dsa_hadamard_;
         }
-        deepseek_v4_pack_dsa_metadata_to_device(dsa, runtime_device);
+        dsa_pack_metadata_to_device(dsa, runtime_device);
 
         if (dsa.actual_seq_lengths_kv.defined() && dsa.seq_lens_q.defined()) {
           dsa.start_pos =
@@ -858,193 +627,6 @@ class DeepseekV4ModelImpl
     return tensor_max_or_zero(fallback_tensor);
   }
 
-  static bool tensor_aliases_storage(const torch::Tensor& lhs,
-                                     const torch::Tensor& rhs) {
-    return lhs.defined() && rhs.defined() && lhs.data_ptr() == rhs.data_ptr() &&
-           lhs.sizes() == rhs.sizes() && lhs.strides() == rhs.strides();
-  }
-
-  static torch::Tensor copy_to_persistent_tensor(const torch::Tensor& src,
-                                                 torch::Tensor& dst) {
-    if (!src.defined()) {
-      return src;
-    }
-    if (!dst.defined()) {
-      dst = torch::empty_like(src);
-    } else {
-      CHECK_EQ(dst.scalar_type(), src.scalar_type())
-          << "DeepSeek V4 graph metadata tensor dtype changed";
-      CHECK_EQ(dst.device(), src.device())
-          << "DeepSeek V4 graph metadata tensor device changed";
-      if (dst.sizes() != src.sizes()) {
-        bool can_copy_into_capacity = dst.dim() == src.dim() && src.dim() > 0 &&
-                                      src.size(0) <= dst.size(0);
-        for (int64_t dim = 1; can_copy_into_capacity && dim < src.dim();
-             ++dim) {
-          can_copy_into_capacity = dst.size(dim) == src.size(dim);
-        }
-        CHECK(can_copy_into_capacity)
-            << "DeepSeek V4 graph metadata tensor size changed from "
-            << dst.sizes() << " to " << src.sizes();
-        // ACL graph metadata uses prefix-valid bucket buffers: replay may
-        // rebuild src after trimming padding, while dst keeps capture capacity.
-        // Copy the valid prefix and clear the padded tail to avoid stale data.
-        dst.zero_();
-        dst.slice(/*dim=*/0, /*start=*/0, /*end=*/src.size(0))
-            .copy_(src, /*non_blocking=*/true);
-        return dst;
-      }
-    }
-    if (!tensor_aliases_storage(src, dst)) {
-      dst.copy_(src, /*non_blocking=*/true);
-    }
-    return dst;
-  }
-
-  static void copy_to_graph_packed_metadata_buffer(
-      layer::DSAMetadata& dsa,
-      DeepseekV4GraphMetadataState::DSAMetadataPersistent& persistent,
-      const torch::Device& runtime_device) {
-#if defined(USE_NPU)
-    if (runtime_device.is_cpu() ||
-        runtime_device.type() != c10::DeviceType::PrivateUse1) {
-      deepseek_v4_move_dsa_metadata_to_device(dsa, runtime_device);
-      return;
-    }
-
-    std::vector<DeepseekV4PackedTensorSpec> specs;
-    deepseek_v4_collect_cpu_metadata_tensors(dsa, runtime_device, specs);
-    const size_t total_bytes = deepseek_v4_layout_packed_tensor_specs(specs);
-    if (total_bytes == 0) {
-      return;
-    }
-
-    if (!persistent.packed_metadata_host_buffer.defined() ||
-        persistent.packed_metadata_host_buffer.scalar_type() != torch::kUInt8 ||
-        persistent.packed_metadata_host_buffer.device() != torch::kCPU ||
-        persistent.packed_metadata_host_buffer.numel() <
-            static_cast<int64_t>(total_bytes)) {
-      persistent.packed_metadata_host_buffer =
-          torch::empty({static_cast<int64_t>(total_bytes)},
-                       torch::TensorOptions()
-                           .dtype(torch::kUInt8)
-                           .device(torch::kCPU)
-                           .pinned_memory(true));
-    }
-    auto host_buffer = persistent.packed_metadata_host_buffer.slice(
-        /*dim=*/0, /*start=*/0, /*end=*/static_cast<int64_t>(total_bytes));
-    deepseek_v4_fill_packed_host_buffer(specs, host_buffer);
-    auto device_options =
-        torch::TensorOptions().dtype(torch::kUInt8).device(runtime_device);
-    if (!persistent.packed_metadata_buffer.defined()) {
-      persistent.packed_metadata_buffer =
-          torch::empty({static_cast<int64_t>(total_bytes)}, device_options);
-    } else {
-      CHECK_EQ(persistent.packed_metadata_host_buffer.scalar_type(),
-               torch::kUInt8)
-          << "DeepSeek V4 graph host packed metadata dtype changed";
-      CHECK_EQ(persistent.packed_metadata_host_buffer.device(), torch::kCPU)
-          << "DeepSeek V4 graph host packed metadata device changed";
-      CHECK_GE(persistent.packed_metadata_host_buffer.numel(),
-               static_cast<int64_t>(total_bytes))
-          << "DeepSeek V4 graph host packed metadata exceeds persistent "
-             "capacity: required="
-          << total_bytes
-          << ", capacity=" << persistent.packed_metadata_host_buffer.numel();
-      CHECK_EQ(persistent.packed_metadata_buffer.scalar_type(), torch::kUInt8)
-          << "DeepSeek V4 graph packed metadata dtype changed";
-      CHECK_EQ(persistent.packed_metadata_buffer.device(), runtime_device)
-          << "DeepSeek V4 graph packed metadata device changed";
-      CHECK_GE(persistent.packed_metadata_buffer.numel(),
-               static_cast<int64_t>(total_bytes))
-          << "DeepSeek V4 graph packed metadata exceeds persistent capacity: "
-          << "required=" << total_bytes
-          << ", capacity=" << persistent.packed_metadata_buffer.numel();
-    }
-
-    persistent.packed_metadata_buffer
-        .slice(/*dim=*/0,
-               /*start=*/0,
-               /*end=*/static_cast<int64_t>(total_bytes))
-        .copy_(host_buffer, /*non_blocking=*/true);
-    dsa.packed_metadata_buffer = persistent.packed_metadata_buffer.slice(
-        /*dim=*/0, /*start=*/0, /*end=*/static_cast<int64_t>(total_bytes));
-    deepseek_v4_bind_packed_tensor_views(specs, dsa.packed_metadata_buffer);
-#else
-    (void)persistent;
-    deepseek_v4_move_dsa_metadata_to_device(dsa, runtime_device);
-#endif
-  }
-
-  static int64_t infer_actual_batch_size(const ModelInputParams& params) {
-    if (params.meta.actual_num_sequences > 0) {
-      return params.meta.actual_num_sequences;
-    }
-    if (!params.attention.host.kv_seq_lens.empty()) {
-      return static_cast<int64_t>(params.attention.host.kv_seq_lens.size());
-    }
-    if (!params.attention.host.q_seq_lens.empty()) {
-      return static_cast<int64_t>(params.attention.host.q_seq_lens.size());
-    }
-    if (params.attention.device.kv_seq_lens.defined() &&
-        params.attention.device.kv_seq_lens.dim() >= 1) {
-      return params.attention.device.kv_seq_lens.size(0);
-    }
-    if (params.attention.device.q_seq_lens.defined() &&
-        params.attention.device.q_seq_lens.dim() >= 1) {
-      return params.attention.device.q_seq_lens.size(0);
-    }
-    if (params.attention.device.block_tables.defined() &&
-        params.attention.device.block_tables.dim() >= 2) {
-      return params.attention.device.block_tables.size(0);
-    }
-    for (const auto& block_table : params.multi_block_tables) {
-      if (block_table.defined() && block_table.dim() >= 2) {
-        return block_table.size(0);
-      }
-    }
-    return 0;
-  }
-
-  void normalize_graph_metadata_input_params(ModelInputParams& params) const {
-    const int64_t actual_batch_size =
-        std::max<int64_t>(infer_actual_batch_size(params), 0);
-    int64_t metadata_batch_size = params.meta.actual_num_sequences;
-    if (params.enable_graph) {
-      metadata_batch_size =
-          std::max<int64_t>(metadata_batch_size, params.meta.num_sequences);
-    }
-    if (metadata_batch_size <= 0) {
-      metadata_batch_size = 1;
-    }
-
-    auto trim_lens_vec = [metadata_batch_size,
-                          actual_batch_size](std::vector<int32_t>& lens) {
-      if (lens.empty()) {
-        lens.assign(static_cast<size_t>(metadata_batch_size), 0);
-      } else if (static_cast<int64_t>(lens.size()) < metadata_batch_size) {
-        lens.resize(static_cast<size_t>(metadata_batch_size), 0);
-      } else {
-        lens.resize(static_cast<size_t>(metadata_batch_size));
-      }
-      for (int64_t i = 0; i < static_cast<int64_t>(lens.size()); ++i) {
-        if (i < actual_batch_size) {
-          lens[static_cast<size_t>(i)] = std::max<int32_t>(lens[i], 1);
-        } else {
-          lens[static_cast<size_t>(i)] = 0;
-        }
-      }
-    };
-
-    // Graph forward tensors are padded to the decode bucket. Build metadata
-    // for the same padded row count so compressor/attention inputs agree.
-    trim_lens_vec(params.attention.host.kv_seq_lens);
-    trim_lens_vec(params.attention.host.q_seq_lens);
-    params.meta.num_sequences = static_cast<int32_t>(metadata_batch_size);
-    params.meta.actual_num_sequences =
-        static_cast<int32_t>(metadata_batch_size);
-  }
-
   std::shared_ptr<layer::AttentionMetadata>
   build_attention_metadata_for_forward(const torch::Tensor& positions,
                                        const ModelInputParams& input_params) {
@@ -1062,20 +644,12 @@ class DeepseekV4ModelImpl
   }
 
   std::shared_ptr<layer::AttentionMetadata> persist_graph_attention_metadata(
-      DeepseekV4GraphMetadataState& state,
+      DSAGraphMetadataState& state,
       std::shared_ptr<layer::AttentionMetadata> metadata) const {
     if (!metadata || !metadata->dsa_metadata) {
       return metadata;
     }
-
-    auto& dsa = *metadata->dsa_metadata;
-    auto& persistent = state.dsa_metadata_persistent;
-
-    dsa.attn_mask =
-        copy_to_persistent_tensor(dsa.attn_mask, persistent.attn_mask);
-    dsa.start_pos =
-        copy_to_persistent_tensor(dsa.start_pos, persistent.start_pos);
-
+    persist_dsa_graph_metadata(state, *metadata->dsa_metadata);
     return metadata;
   }
 
@@ -1090,16 +664,16 @@ class DeepseekV4ModelImpl
     params.meta.actual_num_sequences = 1;
     params.meta.kv_max_seq_len =
         std::max<int32_t>(params.meta.kv_max_seq_len, 1);
-    params.meta.q_max_seq_len = std::max<int32_t>(params.meta.q_max_seq_len, 1);
+    params.meta.q_max_seq_len =
+        std::max<int32_t>(params.meta.q_max_seq_len, 1);
     params.attention.host.kv_seq_lens = {1};
     params.attention.host.q_seq_lens = {1};
-    params.attention.host.q_cu_seq_lens = {0, 1};
     params.attention.device.kv_seq_lens =
         torch::tensor(params.attention.host.kv_seq_lens, cpu_int_options);
     params.attention.device.q_seq_lens =
         torch::tensor(params.attention.host.q_seq_lens, cpu_int_options);
     params.attention.device.q_cu_seq_lens =
-        torch::tensor(params.attention.host.q_cu_seq_lens, cpu_int_options);
+        torch::tensor({1}, cpu_int_options);
     params.attention.device.kv_cache_tokens_nums =
         torch::tensor({1}, cpu_int_options);
     params.attention.host.kv_cache_tokens_nums = {1};
@@ -1123,6 +697,41 @@ class DeepseekV4ModelImpl
       block_num = std::max<int64_t>(block_num, 1);
       params.multi_block_tables.emplace_back(
           torch::zeros({1, block_num}, cpu_int_options));
+    }
+  }
+
+  void fill_empty_dp_rank_graph_metadata_input_params(
+      ModelInputParams& params) const {
+    const int64_t metadata_batch_size =
+        std::max<int64_t>(params.meta.num_sequences, 1);
+    params.meta.num_sequences = static_cast<int32_t>(metadata_batch_size);
+    params.meta.kv_max_seq_len =
+        std::max<int32_t>(params.meta.kv_max_seq_len, 1);
+    params.meta.q_max_seq_len =
+        std::max<int32_t>(params.meta.q_max_seq_len, 1);
+
+    auto pad_lens_vec = [metadata_batch_size](std::vector<int32_t>& lens) {
+      lens.resize(static_cast<size_t>(metadata_batch_size), 1);
+      for (auto& len : lens) {
+        len = std::max<int32_t>(len, 1);
+      }
+    };
+    pad_lens_vec(params.attention.host.kv_seq_lens);
+    pad_lens_vec(params.attention.host.q_seq_lens);
+
+    if (!params.multi_block_tables.empty()) {
+      return;
+    }
+
+    auto cpu_int_options = torch::TensorOptions()
+                               .dtype(torch::kInt32)
+                               .device(torch::kCPU)
+                               .pinned_memory(true);
+    const int32_t manager_num = static_cast<int32_t>(group_infos_.size());
+    params.multi_block_tables.reserve(manager_num);
+    for (int32_t manager_id = 0; manager_id < manager_num; ++manager_id) {
+      params.multi_block_tables.emplace_back(
+          torch::zeros({metadata_batch_size, 1}, cpu_int_options));
     }
   }
 
@@ -1261,7 +870,7 @@ class DeepseekV4ModelImpl
       dsa.hadamard = dsa_hadamard_;
     }
     if (pack_metadata) {
-      deepseek_v4_pack_dsa_metadata_to_device(dsa, runtime_device);
+      dsa_pack_metadata_to_device(dsa, runtime_device);
     }
 
     if (build_rope) {
@@ -1313,9 +922,9 @@ class DeepseekV4ModelImpl
 
     const int64_t batch_size =
         std::max<int64_t>(dsa.actual_seq_lengths_kv.size(0), 1);
-    const int64_t max_seqlen_q =
-        std::max<int64_t>(params.meta.q_max_seq_len,
-                          vector_max_or_zero(params.attention.host.q_seq_lens));
+    const int64_t max_seqlen_q = std::max<int64_t>(
+        params.meta.q_max_seq_len,
+        vector_max_or_zero(params.attention.host.q_seq_lens));
     const int64_t max_seqlen_kv = std::max<int64_t>(
         params.meta.kv_max_seq_len,
         vector_max_or_zero(params.attention.host.kv_seq_lens));
@@ -1440,9 +1049,9 @@ class DeepseekV4ModelImpl
     const int64_t qli_batch_size = std::max<int64_t>(key_lens.size(0), 1);
     const int64_t index_head_dim =
         std::max<int64_t>(index_head_dim_ > 0 ? index_head_dim_ : head_dim_, 1);
-    const int64_t qli_max_seqlen_q =
-        std::max<int64_t>(params.meta.q_max_seq_len,
-                          vector_max_or_zero(params.attention.host.q_seq_lens));
+    const int64_t qli_max_seqlen_q = std::max<int64_t>(
+        params.meta.q_max_seq_len,
+        vector_max_or_zero(params.attention.host.q_seq_lens));
     const int64_t qli_max_seqlen_k = std::max<int64_t>(
         params.meta.kv_max_seq_len,
         vector_max_or_zero(params.attention.host.kv_seq_lens));
@@ -1468,47 +1077,6 @@ class DeepseekV4ModelImpl
     qli_params.device = query_lens.device().str();
     dsa.qli_metadata =
         xllm::kernel::quant_lightning_indexer_metadata(qli_params);
-  }
-
-  void log_layer_weight_mem_stats() const {
-    int64_t total_bytes = 0;
-    int64_t attn_bytes = 0;
-    int64_t expert_bytes = 0;
-    int64_t hc_bytes = 0;
-    int64_t other_bytes = 0;
-
-    for (size_t i = 0; i < layers_.size(); ++i) {
-      const auto stats = layers_[i]->get_weight_mem_stats();
-      total_bytes += stats.total_bytes;
-      attn_bytes += stats.attn_bytes;
-      expert_bytes += stats.expert_bytes;
-      hc_bytes += stats.hc_bytes;
-      other_bytes += stats.other_bytes;
-
-      LOG(INFO) << "[WEIGHT_MEM][DeepseekV4] layer=" << i
-                << " total=" << deepseek_v4_format_bytes(stats.total_bytes)
-                << " (" << stats.total_bytes << " B)"
-                << ", attn=" << deepseek_v4_format_bytes(stats.attn_bytes)
-                << " (" << stats.attn_bytes << " B)"
-                << ", expert=" << deepseek_v4_format_bytes(stats.expert_bytes)
-                << " (" << stats.expert_bytes << " B)"
-                << ", hc_=" << deepseek_v4_format_bytes(stats.hc_bytes) << " ("
-                << stats.hc_bytes << " B)"
-                << ", other=" << deepseek_v4_format_bytes(stats.other_bytes)
-                << " (" << stats.other_bytes << " B)";
-    }
-
-    LOG(INFO) << "[WEIGHT_MEM][DeepseekV4][Summary] layers=" << layers_.size()
-              << ", total=" << deepseek_v4_format_bytes(total_bytes) << " ("
-              << total_bytes << " B)"
-              << ", attn=" << deepseek_v4_format_bytes(attn_bytes) << " ("
-              << attn_bytes << " B)"
-              << ", expert=" << deepseek_v4_format_bytes(expert_bytes) << " ("
-              << expert_bytes << " B)"
-              << ", hc_=" << deepseek_v4_format_bytes(hc_bytes) << " ("
-              << hc_bytes << " B)"
-              << ", other=" << deepseek_v4_format_bytes(other_bytes) << " ("
-              << other_bytes << " B)";
   }
 
   torch::Tensor hc_head(const torch::Tensor& x) {
@@ -1563,7 +1131,6 @@ class DeepseekV4ForCausalLMImpl
                   std::string prefix = "model.") override {
     LlmForCausalLMImplBase<DeepseekV4Model>::load_model(std::move(loader),
                                                         std::move(prefix));
-    this->model_->log_weight_mem_stats();
   }
 
   bool requires_graph_forward_metadata() {

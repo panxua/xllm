@@ -518,6 +518,12 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       params_for_capture->q_seq_lens_vec[i] = 1;
     }
     params_for_capture->num_sequences = padded_num_tokens;
+    params_for_capture->kv_max_seq_len = *std::max_element(
+        params_for_capture->kv_seq_lens_vec.begin(),
+        params_for_capture->kv_seq_lens_vec.end());
+    params_for_capture->q_max_seq_len = *std::max_element(
+        params_for_capture->q_seq_lens_vec.begin(),
+        params_for_capture->q_seq_lens_vec.end());
     params_for_capture->batch_forward_type = BatchForwardType::DECODE;
     params_for_capture->enable_graph = true;
     if (params_for_capture->dp_global_token_nums.size() > 1) {

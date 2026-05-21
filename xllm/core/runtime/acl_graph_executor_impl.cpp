@@ -27,6 +27,7 @@ limitations under the License.
 #include <tuple>
 
 #include "core/common/global_flags.h"
+#include "core/layers/common/attention_metadata.h"
 #include "core/util/tensor_helper.h"
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/framework/OpCommand.h>

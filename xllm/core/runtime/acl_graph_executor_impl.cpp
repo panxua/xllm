@@ -288,6 +288,40 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
         std::max<int64_t>(options_.num_decoding_tokens(), 1);
     actual_batch_size = actual_num_tokens / decode_tokens;
   }
+  LOG(INFO) << "[GraphPersistentParam::update] original:"
+            << " actual_num_tokens=" << actual_num_tokens
+            << " padded_num_tokens=" << padded_num_tokens
+            << " actual_batch_size=" << actual_batch_size
+            << " params.num_sequences=" << params.num_sequences
+            << " params.actual_num_sequences=" << params.actual_num_sequences
+            << " params.kv_max_seq_len=" << params.kv_max_seq_len
+            << " params.q_max_seq_len=" << params.q_max_seq_len
+            << " options.num_decoding_tokens="
+            << options_.num_decoding_tokens()
+            << " return_capture_params=" << return_capture_params
+            << " batch_forward_type=" << params.batch_forward_type.to_string();
+  LOG(INFO) << "[GraphPersistentParam::update] original kv_seq_lens_vec="
+            << params.kv_seq_lens_vec;
+  LOG(INFO) << "[GraphPersistentParam::update] original q_seq_lens_vec="
+            << params.q_seq_lens_vec;
+  LOG(INFO) << "[GraphPersistentParam::update] original dp_global_token_nums="
+            << params.dp_global_token_nums;
+  print_tensor(params.kv_seq_lens,
+               "[GraphPersistentParam::update] original kv_seq_lens", 10);
+  print_tensor(params.q_seq_lens,
+               "[GraphPersistentParam::update] original q_seq_lens", 10);
+  print_tensor(params.q_cu_seq_lens,
+               "[GraphPersistentParam::update] original q_cu_seq_lens", 10);
+  print_tensor(params.new_cache_slots,
+               "[GraphPersistentParam::update] original new_cache_slots", 10);
+  print_tensor(params.block_tables,
+               "[GraphPersistentParam::update] original block_tables", 10);
+  if (params.input_embedding.defined()) {
+    LOG(INFO) << "[GraphPersistentParam::update] original input_embedding shape: "
+              << params.input_embedding.sizes()
+              << " dtype: " << params.input_embedding.dtype()
+              << " device: " << params.input_embedding.device();
+  }
 
   // Copy data from input parameters to persistent graph tensors
   if (actual_num_tokens > 0) {
@@ -565,6 +599,43 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           q_cu_seq_lens_.slice(/*dim=*/0,
                                /*start=*/0,
                                /*end=*/padded_batch_size);
+    }
+
+    LOG(INFO) << "[GraphPersistentParam::update] capture:"
+              << " num_sequences=" << params_for_capture->num_sequences
+              << " actual_num_sequences="
+              << params_for_capture->actual_num_sequences
+              << " kv_max_seq_len=" << params_for_capture->kv_max_seq_len
+              << " q_max_seq_len=" << params_for_capture->q_max_seq_len
+              << " enable_graph=" << params_for_capture->enable_graph
+              << " batch_forward_type="
+              << params_for_capture->batch_forward_type.to_string()
+              << " q_copy_len=" << q_copy_len
+              << " kv_copy_len=" << kv_copy_len
+              << " q_cu_copy_len=" << q_cu_copy_len
+              << " padded_batch_size=" << padded_batch_size;
+    LOG(INFO) << "[GraphPersistentParam::update] capture kv_seq_lens_vec="
+              << params_for_capture->kv_seq_lens_vec;
+    LOG(INFO) << "[GraphPersistentParam::update] capture q_seq_lens_vec="
+              << params_for_capture->q_seq_lens_vec;
+    LOG(INFO) << "[GraphPersistentParam::update] capture dp_global_token_nums="
+              << params_for_capture->dp_global_token_nums;
+    print_tensor(params_for_capture->kv_seq_lens,
+                 "[GraphPersistentParam::update] capture kv_seq_lens", 10);
+    print_tensor(params_for_capture->q_seq_lens,
+                 "[GraphPersistentParam::update] capture q_seq_lens", 10);
+    print_tensor(params_for_capture->q_cu_seq_lens,
+                 "[GraphPersistentParam::update] capture q_cu_seq_lens", 10);
+    print_tensor(params_for_capture->new_cache_slots,
+                 "[GraphPersistentParam::update] capture new_cache_slots", 10);
+    print_tensor(params_for_capture->block_tables,
+                 "[GraphPersistentParam::update] capture block_tables", 10);
+    if (params_for_capture->input_embedding.defined()) {
+      LOG(INFO)
+          << "[GraphPersistentParam::update] capture input_embedding shape: "
+          << params_for_capture->input_embedding.sizes()
+          << " dtype: " << params_for_capture->input_embedding.dtype()
+          << " device: " << params_for_capture->input_embedding.device();
     }
 
     return params_for_capture;

@@ -322,15 +322,6 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
       fill_empty_dp_rank_input_params(modified_input_params);
     }
 
-    if (!modified_input_params.input_embedding.defined()) {
-      auto options = torch::TensorOptions()
-                         .dtype(torch::kBFloat16)
-                         .device(device_);
-      modified_input_params.input_embedding = torch::zeros(
-          {static_cast<int64_t>(modified_input_params.num_sequences), 1, 
-           model_args_.hidden_size()}, options);
-    }
-
     DeepseekV4ModelImpl::normalize_graph_metadata_input_params(
         modified_input_params);
     auto& dp_token_nums = modified_input_params.dp_global_token_nums;
@@ -386,7 +377,9 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
                          .dtype(torch::kBFloat16)
                          .device(device_);
       params.input_embedding = torch::zeros(
-          {static_cast<int64_t>(params.num_sequences), 1, model_args_.hidden_size()}, options);
+          {static_cast<int64_t>(params.num_sequences),
+           model_args_.hidden_size()},
+          options);
     }
 
     if (!params.multi_block_tables.empty()) {

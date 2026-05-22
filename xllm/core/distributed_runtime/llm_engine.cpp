@@ -1121,8 +1121,8 @@ std::vector<ForwardInput> LLMEngine::prepare_inputs(std::vector<Batch>& batch) {
     dp_global_token_nums[dp_rank] =
         static_cast<int32_t>(batched_inputs[dp_rank].host_token_ids().numel());
     if (util::is_deepseek_v4_model_type(args_.model_type())) {
-      const int64_t actual_scheduled_tokens =
-          static_cast<int64_t>(batched_inputs[dp_rank].host_token_ids().numel());
+      const int64_t actual_scheduled_tokens = static_cast<int64_t>(
+          batched_inputs[dp_rank].host_token_ids().numel());
       const int64_t max_tokens_per_batch =
           static_cast<int64_t>(options_.max_tokens_per_batch());
       CHECK_LE(actual_scheduled_tokens, max_tokens_per_batch)

@@ -71,11 +71,12 @@ TEST_F(DeepseekV4IndexerTest, ConstructorAndMetadataWorks) {
 
 TEST_F(DeepseekV4IndexerTest, DsaTokenSlotsTrackCurrentDecodeStep) {
   ModelInputParams params;
-  params.batch_forward_type = BatchForwardType::DECODE;
-  params.num_sequences = 2;
-  params.kv_seq_lens_vec = {5, 8};
-  params.q_seq_lens_vec = {1, 1};
-  params.new_cache_slots = torch::tensor({10, 20}, torch::kInt32);
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.meta.num_sequences = 2;
+  params.attention.host.kv_seq_lens = {5, 8};
+  params.attention.host.q_seq_lens = {1, 1};
+  params.attention.device.new_cache_slots =
+      torch::tensor({10, 20}, torch::kInt32);
   params.multi_block_tables = {
       torch::tensor({{0}, {1}}, torch::kInt32),
       torch::tensor({{0}, {1}}, torch::kInt32),
@@ -108,13 +109,14 @@ TEST_F(DeepseekV4IndexerTest, DsaTokenSlotsTrackCurrentDecodeStep) {
 
 TEST_F(DeepseekV4IndexerTest, DsaSwaBlockTableUsesLogicalColumnsWithoutWrap) {
   ModelInputParams params;
-  params.batch_forward_type = BatchForwardType::DECODE;
-  params.num_sequences = 1;
-  params.kv_seq_lens_vec = {1537};
-  params.q_seq_lens_vec = {1};
-  params.q_max_seq_len = 1;
-  params.kv_max_seq_len = 1537;
-  params.new_cache_slots = torch::tensor({10 * 128}, torch::kInt32);
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.meta.num_sequences = 1;
+  params.attention.host.kv_seq_lens = {1537};
+  params.attention.host.q_seq_lens = {1};
+  params.meta.q_max_seq_len = 1;
+  params.meta.kv_max_seq_len = 1537;
+  params.attention.device.new_cache_slots =
+      torch::tensor({10 * 128}, torch::kInt32);
   params.multi_block_tables = {
       torch::tensor({{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}},
                     torch::kInt32),

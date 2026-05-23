@@ -1095,9 +1095,17 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
 }
 
 TEST(BatchTest, SharedMemoryRoundTripPreservesEmptyRankTensors) {
-  RawForwardInput raw_input;
-  raw_input.batch_forward_type = BatchForwardType::DECODE;
-  raw_input.num_sequences = 0;
+  ForwardInput forward_input;
+  forward_input.token_ids = torch::empty({0}, torch::kInt32);
+  forward_input.token_ids_host = forward_input.token_ids;
+  forward_input.positions = torch::empty({0}, torch::kInt32);
+  forward_input.positions_host = forward_input.positions;
+  forward_input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+  forward_input.input_params.meta.num_sequences = 0;
+  forward_input.input_params.attention.device.q_seq_lens =
+      torch::empty({0}, torch::kInt32);
+  forward_input.input_params.attention.device.kv_seq_lens =
+      torch::empty({0}, torch::kInt32);
 
   bool is_creator = false;
   auto shm_name =
@@ -1110,10 +1118,10 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesEmptyRankTensors) {
   bool is_reader_creator = false;
   ForwardSharedMemoryManager reader_manager(
       shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_INPUT);
-  ASSERT_TRUE(writer_manager.raw_input_write(raw_input));
+  ASSERT_TRUE(writer_manager.input_write(forward_input));
 
   ForwardInput from_shm;
-  reader_manager.raw_input_read(from_shm, torch::Device(torch::kCPU));
+  reader_manager.input_read(from_shm, torch::Device(torch::kCPU));
 
   EXPECT_TRUE(from_shm.token_ids.defined());
   EXPECT_EQ(from_shm.token_ids.numel(), 0);
@@ -1121,10 +1129,10 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesEmptyRankTensors) {
   EXPECT_TRUE(from_shm.positions.defined());
   EXPECT_EQ(from_shm.positions.numel(), 0);
   EXPECT_EQ(from_shm.positions.dim(), 1);
-  EXPECT_TRUE(from_shm.input_params.q_seq_lens.defined());
-  EXPECT_EQ(from_shm.input_params.q_seq_lens.numel(), 0);
-  EXPECT_TRUE(from_shm.input_params.kv_seq_lens.defined());
-  EXPECT_EQ(from_shm.input_params.kv_seq_lens.numel(), 0);
+  EXPECT_TRUE(from_shm.input_params.attention.device.q_seq_lens.defined());
+  EXPECT_EQ(from_shm.input_params.attention.device.q_seq_lens.numel(), 0);
+  EXPECT_TRUE(from_shm.input_params.attention.device.kv_seq_lens.defined());
+  EXPECT_EQ(from_shm.input_params.attention.device.kv_seq_lens.numel(), 0);
 }
 
 TEST(BatchTest, SampleRequestProcessesAllMatchedRawOutputs) {

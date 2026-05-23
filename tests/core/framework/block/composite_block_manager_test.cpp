@@ -174,15 +174,16 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_DifferentBatchSeqs) {
   EXPECT_EQ(c1[1].size(), CeilBlocks(1024, kBlockSizeRatio4));
   EXPECT_EQ(c1[2].size(), CeilBlocks(1024, kBlockSizeRatio128));
 
-  // Seq2: 1500 tokens. Ratio 4: ceil(1500/512)=3; ratio 128:
-  // ceil(1500/16384)=1.
-  Sequence seq2 = MakeTestSequence(1, std::vector<int32_t>(1500, 1));
-  EXPECT_TRUE(manager.allocate_for_sequence(&seq2, 1500));
+  // Seq2: 1400 tokens. Ratio 4: ceil(1400/512)=3; ratio 128:
+  // ceil(1400/16384)=1. Keep total SWA logical blocks within the dynamic
+  // pool budget derived from max_tokens_per_batch.
+  Sequence seq2 = MakeTestSequence(1, std::vector<int32_t>(1400, 1));
+  EXPECT_TRUE(manager.allocate_for_sequence(&seq2, 1400));
   const auto& c2 = seq2.kv_state().composite_blocks();
   ASSERT_EQ(c2.size(), 3u);
-  EXPECT_EQ(c2[0].size(), ExpectedSwaLogicalBlocks(1500));
-  EXPECT_EQ(c2[1].size(), CeilBlocks(1500, kBlockSizeRatio4));
-  EXPECT_EQ(c2[2].size(), CeilBlocks(1500, kBlockSizeRatio128));
+  EXPECT_EQ(c2[0].size(), ExpectedSwaLogicalBlocks(1400));
+  EXPECT_EQ(c2[1].size(), CeilBlocks(1400, kBlockSizeRatio4));
+  EXPECT_EQ(c2[2].size(), CeilBlocks(1400, kBlockSizeRatio128));
 
   // Blocks allocated to different seqs must not overlap (distinct block ids).
   std::set<int32_t> ids1_0, ids1_1, ids1_2, ids2_0, ids2_1, ids2_2;
@@ -268,7 +269,7 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_NullSeqReturnsFalse) {
 }
 
 TEST(CompositeBlockManagerTest, FailedGrowthRollsBackNewBlocks) {
-  BlockManager::Options opts = MakeCompositeOptions(/*base_num_blocks=*/128,
+  BlockManager::Options opts = MakeCompositeOptions(/*base_num_blocks=*/256,
                                                     kBaseBlockSize,
                                                     /*window_size=*/12,
                                                     /*max_seqs_per_batch=*/4);
@@ -322,7 +323,7 @@ TEST(CompositeBlockManagerTest, TokenIncrease_AddsBlocksIncrementally) {
   CompositeBlockManager manager(opts);
 
   Sequence seq = MakeTestSequence(0, {1});
-  std::vector<size_t> token_steps = {100, 600, 1200, 2000, 2500};
+  std::vector<size_t> token_steps = {100, 600, 1200, 2000, 2400};
 
   std::vector<std::set<int32_t>> prev_ids_1;
   std::vector<std::set<int32_t>> prev_ids_2;

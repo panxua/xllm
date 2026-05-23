@@ -32,6 +32,7 @@ namespace {
 
 constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
 constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
+constexpr uint32_t kMaxTokensPerBatch = 1280;
 
 // Base block_size = 128. Two BlockManagerImpl: compress_ratio 4 and 128.
 // - Ratio 4: block_size = 128*4 = 512, num_blocks = base_num_blocks/4.
@@ -49,7 +50,7 @@ BlockManager::Options MakeCompositeOptions(uint32_t base_num_blocks,
       .block_size(block_size)
       .sliding_window_size(window_size)
       .swa_blocks_per_seq(swa_blocks_per_seq)
-      .max_tokens_per_batch(1280)
+      .max_tokens_per_batch(kMaxTokensPerBatch)
       .max_seqs_per_batch(max_seqs_per_batch)
       .manager_types({kManagerTypeSlidingWindowBlockManager,
                       kManagerTypeBlockManagerImpl,
@@ -68,6 +69,10 @@ constexpr uint32_t kBlockSizeRatio128 = kBaseBlockSize * kCompressRatio128;
 
 inline size_t CeilBlocks(size_t num_tokens, size_t block_size) {
   return (num_tokens + block_size - 1) / block_size;
+}
+
+inline size_t ExpectedSwaLogicalBlocks(size_t num_tokens) {
+  return CeilBlocks(num_tokens, kBaseBlockSize);
 }
 
 // Creates a minimal Sequence for testing (same pattern as batch_test.cpp).
@@ -104,8 +109,6 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_SingleSeq) {
   const uint32_t base_num_blocks = 4096;  // ratio-4: 1024 blocks, ratio-128: 32
   const uint32_t window_size = 128;
   const uint32_t max_seqs_per_batch = 4;
-  const uint32_t sliding_window_blocks_per_sequence = static_cast<uint32_t>(
-      get_swa_blocks_per_seq(window_size, base_block_size));
 
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, base_block_size, window_size, max_seqs_per_batch);
@@ -123,9 +126,8 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_SingleSeq) {
       seq.kv_state().composite_blocks();
   ASSERT_EQ(composite.size(), 3u);
 
-  // Sub-manager 0: SlidingWindow, block count derived from window_size and
-  // block_size.
-  EXPECT_EQ(composite[0].size(), sliding_window_blocks_per_sequence);
+  // Sub-manager 0: SlidingWindow, logical block count follows sequence length.
+  EXPECT_EQ(composite[0].size(), ExpectedSwaLogicalBlocks(num_tokens));
   for (const auto& b : composite[0]) {
     EXPECT_TRUE(b.is_valid());
     EXPECT_EQ(b.size(), base_block_size);
@@ -168,7 +170,7 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_DifferentBatchSeqs) {
   EXPECT_TRUE(manager.allocate_for_sequence(&seq1, 1024));
   const auto& c1 = seq1.kv_state().composite_blocks();
   ASSERT_EQ(c1.size(), 3u);
-  EXPECT_EQ(c1[0].size(), sliding_window_blocks_per_sequence);
+  EXPECT_EQ(c1[0].size(), ExpectedSwaLogicalBlocks(1024));
   EXPECT_EQ(c1[1].size(), CeilBlocks(1024, kBlockSizeRatio4));
   EXPECT_EQ(c1[2].size(), CeilBlocks(1024, kBlockSizeRatio128));
 
@@ -178,7 +180,7 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_DifferentBatchSeqs) {
   EXPECT_TRUE(manager.allocate_for_sequence(&seq2, 1500));
   const auto& c2 = seq2.kv_state().composite_blocks();
   ASSERT_EQ(c2.size(), 3u);
-  EXPECT_EQ(c2[0].size(), sliding_window_blocks_per_sequence);
+  EXPECT_EQ(c2[0].size(), ExpectedSwaLogicalBlocks(1500));
   EXPECT_EQ(c2[1].size(), CeilBlocks(1500, kBlockSizeRatio4));
   EXPECT_EQ(c2[2].size(), CeilBlocks(1500, kBlockSizeRatio128));
 
@@ -194,7 +196,8 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_DifferentBatchSeqs) {
   for (int32_t id : ids1_1) EXPECT_EQ(ids2_1.count(id), 0u);
   for (int32_t id : ids1_2) EXPECT_EQ(ids2_2.count(id), 0u);
   const int32_t max_swa_block_id =
-      sliding_window_blocks_per_sequence * max_seqs_per_batch + 1;
+      sliding_window_blocks_per_sequence * max_seqs_per_batch +
+      CeilBlocks(kMaxTokensPerBatch, kBaseBlockSize) + max_seqs_per_batch + 1;
   for (int32_t id : ids1_0) EXPECT_LE(id, max_swa_block_id);
   for (int32_t id : ids2_0) EXPECT_LE(id, max_swa_block_id);
 
@@ -206,8 +209,6 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_GrowSameSeq) {
   const uint32_t base_num_blocks = 4096;
   const uint32_t window_size = 128;
   const uint32_t max_seqs_per_batch = 4;
-  const uint32_t sliding_window_blocks_per_sequence = static_cast<uint32_t>(
-      get_swa_blocks_per_seq(window_size, kBaseBlockSize));
 
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
@@ -218,14 +219,14 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_GrowSameSeq) {
   EXPECT_TRUE(manager.allocate_for_sequence(&seq, 600));
   const std::vector<std::vector<Block>>& c0 = seq.kv_state().composite_blocks();
   ASSERT_EQ(c0.size(), 3u);
-  EXPECT_EQ(c0[0].size(), sliding_window_blocks_per_sequence);
+  EXPECT_EQ(c0[0].size(), ExpectedSwaLogicalBlocks(600));
   EXPECT_EQ(c0[1].size(), CeilBlocks(600, kBlockSizeRatio4));
   EXPECT_EQ(c0[2].size(), CeilBlocks(600, kBlockSizeRatio128));
 
   // Grow to 1200 tokens: ratio 4 needs 3 blocks, ratio 128 still 1 block.
   EXPECT_TRUE(manager.allocate_for_sequence(&seq, 1200));
   const std::vector<std::vector<Block>>& c1 = seq.kv_state().composite_blocks();
-  EXPECT_EQ(c1[0].size(), sliding_window_blocks_per_sequence);
+  EXPECT_EQ(c1[0].size(), ExpectedSwaLogicalBlocks(1200));
   EXPECT_EQ(c1[1].size(), CeilBlocks(1200, kBlockSizeRatio4));
   EXPECT_EQ(c1[2].size(), CeilBlocks(1200, kBlockSizeRatio128));
 
@@ -272,8 +273,6 @@ TEST(CompositeBlockManagerTest, TokenIncrease_AddsBlocksIncrementally) {
   const uint32_t base_num_blocks = 4096;
   const uint32_t window_size = 128;
   const uint32_t max_seqs_per_batch = 4;
-  const uint32_t sliding_window_blocks_per_sequence = static_cast<uint32_t>(
-      get_swa_blocks_per_seq(window_size, kBaseBlockSize));
 
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
@@ -317,12 +316,12 @@ TEST(CompositeBlockManagerTest, TokenIncrease_AddsBlocksIncrementally) {
   manager.deallocate_sequence(&seq);
 }
 
-TEST(CompositeBlockManagerTest, SlidingWindowBlockOrderStaysStable) {
+TEST(CompositeBlockManagerTest, SlidingWindowReleasesSkippedPhysicalBlocks) {
   const uint32_t base_num_blocks = 4096;
-  const uint32_t window_size = 128;
+  const uint32_t sliding_window_blocks_per_sequence = 3;
+  const uint32_t window_size =
+      sliding_window_blocks_per_sequence * kBaseBlockSize;
   const uint32_t max_seqs_per_batch = 4;
-  const uint32_t sliding_window_blocks_per_sequence = static_cast<uint32_t>(
-      get_swa_blocks_per_seq(window_size, kBaseBlockSize));
 
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
@@ -336,6 +335,7 @@ TEST(CompositeBlockManagerTest, SlidingWindowBlockOrderStaysStable) {
   const auto& initial = seq.kv_state().composite_blocks();
   ASSERT_EQ(initial.size(), 3u);
   ASSERT_EQ(initial[0].size(), sliding_window_blocks_per_sequence);
+  seq.kv_state().incr_kv_cache_tokens_num(window_tokens);
 
   std::vector<int32_t> initial_ids;
   initial_ids.reserve(initial[0].size());
@@ -343,18 +343,26 @@ TEST(CompositeBlockManagerTest, SlidingWindowBlockOrderStaysStable) {
     initial_ids.push_back(block.id());
   }
 
-  EXPECT_TRUE(manager.allocate_for_sequence(&seq, window_tokens));
+  EXPECT_TRUE(
+      manager.allocate_for_sequence(&seq, window_tokens + 2 * kBaseBlockSize));
   const auto& boundary = seq.kv_state().composite_blocks();
-  ASSERT_EQ(boundary[0].size(), sliding_window_blocks_per_sequence);
+  ASSERT_EQ(boundary[0].size(), sliding_window_blocks_per_sequence + 2);
   for (size_t i = 0; i < initial_ids.size(); ++i) {
     EXPECT_EQ(boundary[0][i].id(), initial_ids[i]);
   }
+  seq.kv_state().incr_kv_cache_tokens_num(2 * kBaseBlockSize);
 
-  EXPECT_TRUE(manager.allocate_for_sequence(&seq, window_tokens + 1));
+  EXPECT_TRUE(
+      manager.allocate_for_sequence(&seq, window_tokens + 3 * kBaseBlockSize));
   const auto& exceeded = seq.kv_state().composite_blocks();
-  ASSERT_EQ(exceeded[0].size(), sliding_window_blocks_per_sequence);
-  for (size_t i = 0; i < initial_ids.size(); ++i) {
+  ASSERT_EQ(exceeded[0].size(), sliding_window_blocks_per_sequence + 3);
+  EXPECT_FALSE(exceeded[0][0].is_valid());
+  EXPECT_FALSE(exceeded[0][1].is_valid());
+  for (size_t i = 2; i < initial_ids.size(); ++i) {
     EXPECT_EQ(exceeded[0][i].id(), initial_ids[i]);
+  }
+  for (size_t i = initial_ids.size(); i < exceeded[0].size(); ++i) {
+    EXPECT_TRUE(exceeded[0][i].is_valid());
   }
 
   manager.deallocate_sequence(&seq);

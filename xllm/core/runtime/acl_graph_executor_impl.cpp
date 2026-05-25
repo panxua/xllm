@@ -1289,6 +1289,10 @@ bool AclGraph::capture(CausalLM* model,
   CHECK(graph_params.has_value())
       << "update() should return ModelInputParams when "
          "return_capture_params=true";
+  prepare_model_graph_metadata(model,
+                               persistent_param_.persistent_positions(
+                                   num_tokens_),
+                               graph_params.value());
 
   // Synchronize stream to ensure all data is copied to graph persistent buffers
   aclrtSynchronizeStream(stream);
@@ -1365,13 +1369,30 @@ void AclGraph::initialize_capture_stream(c10::DeviceIndex device_index) {
             << ", device_index: " << device_index;
 }
 
+void AclGraph::prepare_model_graph_metadata(CausalLM* model,
+                                            const torch::Tensor& positions,
+                                            ModelInputParams& params) {
+  CHECK(model != nullptr) << "ACL graph model must not be null";
+  if (!model->requires_graph_forward_metadata()) {
+    return;
+  }
+  if (!model_graph_metadata_state_) {
+    model_graph_metadata_state_ = model->create_graph_forward_metadata_state();
+    CHECK(model_graph_metadata_state_)
+        << "model requires graph forward metadata but did not create state";
+  }
+  model->prepare_graph_forward_metadata(
+      model_graph_metadata_state_.get(), positions, params);
+  CHECK(params.attn_metadata)
+      << "model graph metadata preparation did not populate attn_metadata";
+}
+
 ModelOutput AclGraph::replay(CausalLM* model,
                              const ModelArgs& args,
                              const torch::Tensor& tokens,
                              const torch::Tensor& positions,
                              std::vector<KVCache>& kv_cache,
                              const ModelInputParams& params) {
-  (void)model;
   (void)args;
   const uint32_t actual_num_tokens = tokens.size(0);
   CHECK_LE(actual_num_tokens, num_tokens_)
@@ -1384,13 +1405,24 @@ ModelOutput AclGraph::replay(CausalLM* model,
   // be updated when Full Attention layers are involved, which is determined
   // by k_cache being valid and non-empty
   auto [k_cache, v_cache] = find_attention_plan_kv_cache(kv_cache);
-  persistent_param_.update(tokens,
-                           k_cache,
-                           v_cache,
-                           positions,
-                           params,
-                           num_tokens_,
-                           /*return_capture_params=*/false);
+  const bool needs_graph_metadata = model->requires_graph_forward_metadata();
+  std::optional<ModelInputParams> graph_params =
+      persistent_param_.update(tokens,
+                               k_cache,
+                               v_cache,
+                               positions,
+                               params,
+                               num_tokens_,
+                               needs_graph_metadata);
+  if (needs_graph_metadata) {
+    CHECK(graph_params.has_value())
+        << "update() should return ModelInputParams when graph metadata is "
+           "required";
+    prepare_model_graph_metadata(model,
+                                 persistent_param_.persistent_positions(
+                                     num_tokens_),
+                                 graph_params.value());
+  }
 
   // Replay captured graph - NPUGraph mempool reuses temporary tensors
   // Get current NPU stream from libtorch NPU API

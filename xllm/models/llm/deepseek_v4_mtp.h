@@ -215,7 +215,8 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
                       const ModelInputParams& input_params) {
     torch::NoGradGuard no_grad;
 
-    if (!tokens.defined() || tokens.numel() == 0) {
+    const bool is_empty_dp_rank = !tokens.defined() || tokens.numel() == 0;
+    if (is_empty_dp_rank) {
       tokens = torch::tensor(
           {0}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
       positions = torch::tensor(
@@ -224,7 +225,13 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
 
     const torch::Device runtime_device = tokens.device();
 
-    torch::Tensor previous_hidden_states = input_params.embedding.input_embedding;
+    auto modified_input_params = input_params;
+    if (is_empty_dp_rank) {
+      fill_empty_dp_rank_input_params(modified_input_params);
+    }
+
+    torch::Tensor previous_hidden_states =
+        modified_input_params.embedding.input_embedding;
     CHECK(previous_hidden_states.defined())
         << "input_params.embedding.input_embedding must be defined for MTP model";
 
@@ -236,9 +243,9 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
           << "[DeepseekV4Mtp] ACL graph requires tokens on the runtime device";
       CHECK(positions.defined() && positions.device() == runtime_device)
           << "[DeepseekV4Mtp] ACL graph requires positions on the runtime device";
-      CHECK(input_params.new_cache_slots.defined())
+      CHECK(modified_input_params.attention.device.new_cache_slots.defined())
           << "[DeepseekV4Mtp] ACL graph requires persistent new_cache_slots";
-      CHECK(input_params.block_tables.defined())
+      CHECK(modified_input_params.attention.device.block_tables.defined())
           << "[DeepseekV4Mtp] ACL graph requires persistent block_tables";
     } else {
       tokens = maybe_to_device(tokens, runtime_device);
@@ -251,7 +258,6 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
                                torch::zeros_like(hidden_states.index({mask})));
     }
 
-    auto modified_input_params = input_params;
     if (acl_graph_forward) {
       normalize_graph_metadata_input_params(modified_input_params);
     }
@@ -314,11 +320,11 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
         << "[DeepseekV4Mtp] received incompatible graph metadata state";
 
     auto modified_input_params = input_params;
-    if (modified_input_params.actual_num_sequences == 0) {
+    if (modified_input_params.meta.actual_num_sequences == 0) {
       fill_empty_dp_rank_input_params(modified_input_params);
     }
     normalize_graph_metadata_input_params(modified_input_params);
-    auto& dp_token_nums = modified_input_params.dp_global_token_nums;
+    auto& dp_token_nums = modified_input_params.parallel.dp_global_token_nums;
     std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
 
     auto attn_metadata = std::make_shared<layer::AttentionMetadata>(
@@ -472,12 +478,12 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
   //   Rows in [actual_metadata_rows, padded_metadata_rows) are bucket padding
   //   and must be zeroed so DSAMetadataBuilder treats them as inactive.
   void normalize_graph_metadata_input_params(ModelInputParams& params) const {
-    int64_t actual_metadata_rows = std::max<int64_t>(params.actual_num_sequences,
-                                                    0);
+    int64_t actual_metadata_rows =
+        std::max<int64_t>(params.meta.actual_num_sequences, 0);
     int64_t padded_metadata_rows = actual_metadata_rows;
-    if (params.enable_graph) {
+    if (params.enable_cuda_graph) {
       padded_metadata_rows =
-          std::max<int64_t>(padded_metadata_rows, params.num_sequences);
+          std::max<int64_t>(padded_metadata_rows, params.meta.num_sequences);
     }
     if (padded_metadata_rows <= 0) {
       padded_metadata_rows = 1;
@@ -486,7 +492,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
                                              padded_metadata_rows);
 
     auto trim_lens_vec = [padded_metadata_rows,
-                          actual_metadata_rows](std::vector<int>& lens) {
+                          actual_metadata_rows](std::vector<int32_t>& lens) {
       if (lens.empty()) {
         lens.assign(static_cast<size_t>(padded_metadata_rows), 0);
       } else if (static_cast<int64_t>(lens.size()) < padded_metadata_rows) {
@@ -497,10 +503,11 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
       std::fill(lens.begin() + actual_metadata_rows, lens.end(), 0);
     };
 
-    trim_lens_vec(params.kv_seq_lens_vec);
-    trim_lens_vec(params.q_seq_lens_vec);
-    params.num_sequences = static_cast<int32_t>(padded_metadata_rows);
-    params.actual_num_sequences = static_cast<int32_t>(actual_metadata_rows);
+    trim_lens_vec(params.attention.host.kv_seq_lens);
+    trim_lens_vec(params.attention.host.q_seq_lens);
+    params.meta.num_sequences = static_cast<int32_t>(padded_metadata_rows);
+    params.meta.actual_num_sequences =
+        static_cast<int32_t>(actual_metadata_rows);
   }
 
   std::shared_ptr<layer::AttentionMetadata> persist_graph_attention_metadata(
@@ -526,19 +533,27 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
                                .dtype(torch::kInt32)
                                .device(torch::kCPU)
                                .pinned_memory(true);
-    params.num_sequences = 1;
-    params.actual_num_sequences = 1;
-    params.kv_max_seq_len = std::max<uint32_t>(params.kv_max_seq_len, 1);
-    params.q_max_seq_len = std::max<uint32_t>(params.q_max_seq_len, 1);
-    params.kv_seq_lens_vec = {1};
-    params.q_seq_lens_vec = {1};
-    params.kv_seq_lens = torch::tensor(params.kv_seq_lens_vec, cpu_int_options);
-    params.q_seq_lens = torch::tensor(params.q_seq_lens_vec, cpu_int_options);
-    params.q_cu_seq_lens = torch::tensor({1}, cpu_int_options);
-    params.kv_cache_tokens_nums = torch::tensor({1}, cpu_int_options);
-    params.kv_cache_tokens_nums_host = {1};
-    params.new_cache_slots = torch::tensor({0}, cpu_int_options);
-    params.block_tables = torch::zeros({1, 1}, cpu_int_options);
+    params.meta.num_sequences = 1;
+    params.meta.actual_num_sequences = 1;
+    params.meta.kv_max_seq_len =
+        std::max<int32_t>(params.meta.kv_max_seq_len, 1);
+    params.meta.q_max_seq_len =
+        std::max<int32_t>(params.meta.q_max_seq_len, 1);
+    params.attention.host.kv_seq_lens = {1};
+    params.attention.host.q_seq_lens = {1};
+    params.attention.device.kv_seq_lens =
+        torch::tensor(params.attention.host.kv_seq_lens, cpu_int_options);
+    params.attention.device.q_seq_lens =
+        torch::tensor(params.attention.host.q_seq_lens, cpu_int_options);
+    params.attention.device.q_cu_seq_lens =
+        torch::tensor({1}, cpu_int_options);
+    params.attention.device.kv_cache_tokens_nums =
+        torch::tensor({1}, cpu_int_options);
+    params.attention.host.kv_cache_tokens_nums = {1};
+    params.attention.device.new_cache_slots =
+        torch::tensor({0}, cpu_int_options);
+    params.attention.device.block_tables =
+        torch::zeros({1, 1}, cpu_int_options);
 
     if (!params.multi_block_tables.empty()) {
       return;

@@ -649,6 +649,8 @@ std::shared_ptr<Request> ProfileManager::generate_single_decode_request(
   RequestState req_state(prompt_token_ids);
   req_state.enable_schedule_overlap = options_.enable_schedule_overlap();
   req_state.seq_capacity = total_length + 1;
+  req_state.stopping_checker.set_max_generated_tokens(2);
+  req_state.stopping_checker.set_max_context_len(total_length + 1);
   auto request = std::make_shared<Request>(
       /*request_id=*/"",
       /*x_request_id=*/"",

@@ -148,7 +148,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     mtp_layers_.reserve(mtp_n_layers);
     for (int32_t i = 0; i < mtp_n_layers; ++i) {
       const int32_t layer_index = i;
-      mtp_layers_.push_back(
+      mtp_layers_.emplace_back(
           DeepseekV4MultiTokenPredictorLayer(context, layer_index));
       register_module("layer_" + std::to_string(i), mtp_layers_.back());
     }
@@ -470,44 +470,44 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
   // Normalize metadata vectors for graph mode (bucket-padded) forward.
   //
   // Key concepts:
-  //   actual_metadata_rows  -- rows that carry real token data.
-  //                            For normal decode: = num_requests.
-  //                            For MTP validate:  = num_requests * (1 + num_spec_tokens).
-  //   padded_metadata_rows  -- total rows after bucket padding.
-  //                            >= actual_metadata_rows, rounded up to decode bucket.
-  //   Rows in [actual_metadata_rows, padded_metadata_rows) are bucket padding
+  //   actual_num_tokens  -- rows that carry real token data.
+  //                         For normal decode: = num_requests.
+  //                         For MTP validate:  = num_requests * (1 + num_spec_tokens).
+  //   padded_num_tokens  -- total rows after bucket padding.
+  //                         >= actual_num_tokens, rounded up to decode bucket.
+  //   Rows in [actual_num_tokens, padded_num_tokens) are bucket padding
   //   and must be zeroed so DSAMetadataBuilder treats them as inactive.
   void normalize_graph_metadata_input_params(ModelInputParams& params) const {
-    int64_t actual_metadata_rows =
+    int64_t actual_num_tokens =
         std::max<int64_t>(params.meta.actual_num_sequences, 0);
-    int64_t padded_metadata_rows = actual_metadata_rows;
+    int64_t padded_num_tokens = actual_num_tokens;
     if (params.enable_cuda_graph) {
-      padded_metadata_rows =
-          std::max<int64_t>(padded_metadata_rows, params.meta.num_sequences);
+      padded_num_tokens =
+          std::max<int64_t>(padded_num_tokens, params.meta.num_sequences);
     }
-    if (padded_metadata_rows <= 0) {
-      padded_metadata_rows = 1;
+    if (padded_num_tokens <= 0) {
+      padded_num_tokens = 1;
     }
-    actual_metadata_rows = std::min<int64_t>(actual_metadata_rows,
-                                             padded_metadata_rows);
+    actual_num_tokens = std::min<int64_t>(actual_num_tokens,
+                                          padded_num_tokens);
 
-    auto trim_lens_vec = [padded_metadata_rows,
-                          actual_metadata_rows](std::vector<int32_t>& lens) {
+    auto trim_lens_vec = [padded_num_tokens,
+                          actual_num_tokens](std::vector<int32_t>& lens) {
       if (lens.empty()) {
-        lens.assign(static_cast<size_t>(padded_metadata_rows), 0);
-      } else if (static_cast<int64_t>(lens.size()) < padded_metadata_rows) {
-        lens.resize(static_cast<size_t>(padded_metadata_rows), 0);
+        lens.assign(static_cast<size_t>(padded_num_tokens), 0);
+      } else if (static_cast<int64_t>(lens.size()) < padded_num_tokens) {
+        lens.resize(static_cast<size_t>(padded_num_tokens), 0);
       } else {
-        lens.resize(static_cast<size_t>(padded_metadata_rows));
+        lens.resize(static_cast<size_t>(padded_num_tokens));
       }
-      std::fill(lens.begin() + actual_metadata_rows, lens.end(), 0);
+      std::fill(lens.begin() + actual_num_tokens, lens.end(), 0);
     };
 
     trim_lens_vec(params.attention.host.kv_seq_lens);
     trim_lens_vec(params.attention.host.q_seq_lens);
-    params.meta.num_sequences = static_cast<int32_t>(padded_metadata_rows);
+    params.meta.num_sequences = static_cast<int32_t>(padded_num_tokens);
     params.meta.actual_num_sequences =
-        static_cast<int32_t>(actual_metadata_rows);
+        static_cast<int32_t>(actual_num_tokens);
   }
 
   std::shared_ptr<layer::AttentionMetadata> persist_graph_attention_metadata(
@@ -562,7 +562,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     const int32_t manager_num = static_cast<int32_t>(group_infos_.size());
     params.multi_block_tables.reserve(manager_num);
     for (int32_t manager_id = 0; manager_id < manager_num; ++manager_id) {
-      params.multi_block_tables.push_back(
+      params.multi_block_tables.emplace_back(
           torch::zeros({1, 1}, cpu_int_options));
     }
   }

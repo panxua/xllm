@@ -23,8 +23,20 @@ namespace xllm::kernel::npu {
 void scatter_nd_update(torch::Tensor& var,
                        const torch::Tensor& indices,
                        const torch::Tensor& updates) {
+  torch::Tensor normalized_indices = indices.scalar_type() == torch::kInt32
+                                         ? indices
+                                         : indices.to(torch::kInt32);
+  if (!normalized_indices.is_contiguous()) {
+    normalized_indices = normalized_indices.contiguous();
+  }
+  torch::Tensor normalized_updates =
+      updates.is_contiguous() ? updates : updates.contiguous();
   at::IntArrayRef var_stride = var.strides();
-  EXEC_NPU_CMD(aclnnScatterNdUpdateV2, var, indices, updates, var_stride);
+  EXEC_NPU_CMD(aclnnScatterNdUpdateV2,
+               var,
+               normalized_indices,
+               normalized_updates,
+               var_stride);
 }
 
 }  // namespace xllm::kernel::npu

@@ -120,9 +120,11 @@ void verify_cache_write_case(const CacheWriteCase& test_case) {
   torch::Tensor xllm_cache = base_cache.clone();
   torch::Tensor npu_cache = base_cache.clone();
   xllm_scatter_by_slot_mirror(xllm_cache, slot_mapping, update);
-  torch::Tensor npu_cache_2d =
-      npu_cache.view({-1, update.size(update.dim() - 1)});
-  xllm::kernel::npu::scatter_nd_update(npu_cache_2d, indices, update);
+  // update: [num_tokens, num_kv_heads, head_dim] or [num_tokens, head_dim]
+  // update_2d: [num_tokens * num_kv_heads, head_dim]
+  torch::Tensor npu_cache_2d = npu_cache.view({-1, test_case.head_dim});
+  xllm::kernel::npu::scatter_nd_update(
+      npu_cache_2d, indices, update.reshape({-1, test_case.head_dim}));
   EXPECT_TRUE(torch::allclose(xllm_cache, npu_cache, /*rtol=*/0, /*atol=*/0))
       << "cache write mismatch for " << test_case.name;
 }

@@ -75,7 +75,6 @@ cc_library(
     :common
     :platform
     :model_context
-    :multimodal
     :request
     :state_dict
     :dit_cache

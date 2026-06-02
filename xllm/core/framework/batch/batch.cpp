@@ -520,9 +520,11 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
       }
     }
 
-    const bool missing_output = output_idx >= raw_output.outputs.size();
+    const size_t output_row =
+        target.from_sample_slot ? target.sample_id : output_idx;
+    const bool missing_output = output_row >= raw_output.outputs.size();
     const bool empty_output =
-        !missing_output && raw_output.outputs[output_idx].tokens.empty();
+        !missing_output && raw_output.outputs[output_row].tokens.empty();
     if (missing_output || empty_output) {
       if (target.from_sample_slot) {
         append_token_for_sequence(
@@ -531,7 +533,7 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
       continue;
     }
 
-    const auto& raw_sample_output = raw_output.outputs[output_idx];
+    const auto& raw_sample_output = raw_output.outputs[output_row];
     for (size_t token_idx = 0; token_idx < raw_sample_output.tokens.size();
          ++token_idx) {
       const auto& raw_token = raw_sample_output.tokens[token_idx];
@@ -663,7 +665,9 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
       }
     }
 
-    if (output_idx >= static_cast<size_t>(num_outputs)) {
+    const size_t output_row =
+        target.from_sample_slot ? target.sample_id : output_idx;
+    if (output_row >= static_cast<size_t>(num_outputs)) {
       if (target.from_sample_slot) {
         append_token_for_sequence(
             seq, make_empty_logprob_placeholder(*seq), 0, replace_fake_token);
@@ -671,7 +675,7 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
       continue;
     }
 
-    const auto token = build_token(output_idx,
+    const auto token = build_token(output_row,
                                    sample_output.next_tokens,
                                    sample_output.logprobs,
                                    sample_output.top_tokens,

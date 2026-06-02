@@ -373,21 +373,8 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   is_first_token_ = cur_generated_token_idx_ == num_prompt_tokens_;
   record_first_token(token);
 
-  // for mtp, currently only support multi-nodes task.
-  if (token_offset > 0 && cur_generated_token_idx_ >= num_tokens_) {
-    // Skip MTP token processing if sequence has no KV cache blocks.
-    // This happens when the sequence was preempted during schedule_request(),
-    // causing its KV cache to be deallocated (reset), but it's still in
-    // last_batch_ being processed by update_last_step_result().
-    if (kv_state_.num_kv_blocks() == 0) {
-      return;
-    }
-    kv_state_.incr_kv_cache_tokens_num(1);
-    num_tokens_++;
-    // when enable speculative decoding, fake token id will be covered.
-    tokens_[cur_generated_token_idx_ + 2] =
-        tokens_[cur_generated_token_idx_ + 1];
-    tokens_[cur_generated_token_idx_ + 1] = tokens_[cur_generated_token_idx_];
+  if (token_offset > 0 && kv_state_.num_kv_blocks() == 0) {
+    return;
   }
 
   const int32_t token_id = static_cast<int32_t>(token.id);

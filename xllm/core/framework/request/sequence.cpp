@@ -374,7 +374,7 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   record_first_token(token);
 
   // for mtp, currently only support multi-nodes task.
-  if (token_offset > 0) {
+  if (token_offset > 0 && cur_generated_token_idx_ >= num_tokens_) {
     // Skip MTP token processing if sequence has no KV cache blocks.
     // This happens when the sequence was preempted during schedule_request(),
     // causing its KV cache to be deallocated (reset), but it's still in
